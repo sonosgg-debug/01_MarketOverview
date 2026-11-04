@@ -16,7 +16,7 @@ K_MARKET_TICKERS = [
 ]
 
 SEMI_MARKET_TICKERS = [
-    '^SOX', 'NVDA', 'MU', 'SNDK', 'INTC', 'AMD', 'PLTR', 'ORCL', 'AVGO', 'DRAM', 'CCML', 'AIQ', 'BAI',
+    '^SOX', 'NVDA', 'MU', 'SNDK', 'INTC', 'AMD', 'PLTR', 'ORCL', 'AVGO', 'NBIS', 'CRWV', 'DRAM', 'CCML', 'AIQ', 'BAI',
     '005930.KS', '009150.KS', '402340.KS', '000660.KS', 'SKHY', '285A.T', '6981.T', '688825.SS'
 ]
 
@@ -87,6 +87,8 @@ INDICATORS_META = {
     'PLTR': {'name': '팔란티어(PLTR)', 'negative_favorable': False},
     'ORCL': {'name': '오라클(ORCL)', 'negative_favorable': False},
     'AVGO': {'name': '브로드컴(AVGO)', 'negative_favorable': False},
+    'NBIS': {'name': '네비우스(NBIS)', 'negative_favorable': False},
+    'CRWV': {'name': '코어위브(CRWV)', 'negative_favorable': False},
     'DRAM': {'name': 'DRAM (Roundhill ETF)', 'negative_favorable': False},
     'CCML': {'name': 'CCML (Roundhill ETF)', 'negative_favorable': False},
     'AIQ': {'name': 'AIQ (Global X ETF)', 'negative_favorable': False},

@@ -474,5 +474,41 @@
     {
         "date": "2026-10-21",
         "liquidation": 129.92
+    },
+    {
+        "date": "2026-10-22",
+        "liquidation": 106.21
+    },
+    {
+        "date": "2026-10-23",
+        "liquidation": 74.69
+    },
+    {
+        "date": "2026-10-26",
+        "liquidation": 111.1
+    },
+    {
+        "date": "2026-10-27",
+        "liquidation": 193.41
+    },
+    {
+        "date": "2026-10-28",
+        "liquidation": 49.71
+    },
+    {
+        "date": "2026-10-29",
+        "liquidation": 36.62
+    },
+    {
+        "date": "2026-10-30",
+        "liquidation": 32.92
+    },
+    {
+        "date": "2026-11-02",
+        "liquidation": 111.83
+    },
+    {
+        "date": "2026-11-03",
+        "liquidation": 96.94
     }
 ]
