@@ -1337,12 +1337,15 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
     Gracefully falls back to existing_item (from krx_cache.json) if unavailable.
     """
     try:
-        url = "https://esignal.co.kr/data/cache/kospif_ngt.js"
+        import time as _time
+        url = f"https://esignal.co.kr/data/cache/kospif_ngt.js?_={int(_time.time() * 1000)}"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://esignal.co.kr/kospi200-futures-night/"
         }
-        res = requests.get(url, headers=headers, timeout=4)
+        res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             cdata = res.json()
             pts = cdata.get("data", [])
@@ -1448,7 +1451,8 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
                     "history": history,
                     "negative_favorable": meta.get("negative_favorable", False),
                     "is_integer_only": False,
-                    "is_percent": False
+                    "is_percent": False,
+                    "trade_date": session_end_date
                 }
 
                 # Update krx_cache.json in background so cache file stays fresh
