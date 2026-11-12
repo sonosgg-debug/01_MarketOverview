@@ -707,10 +707,22 @@ def task_night_futures(futures_price_ref):
                     night_history = [{"date": format_iso_date(item['date']), "value": round(float(item['price']), 2)} for item in night_data]
                     prev_price = round(float(night_data[-2]['price']), 2) if len(night_data) >= 2 else latest_night_from_file
                 else:
+                    # When live connection failed or market closed: preserve existing valid cache if aligned
+                    if old_cache and isinstance(old_cache.get("kospi200_night"), dict):
+                        old_ngt = old_cache["kospi200_night"]
+                        old_hist = old_ngt.get("history", [])
+                        old_date = old_hist[-1]["date"][:10] if old_hist else None
+                        if old_date == last_hist_date and old_ngt.get("price") is not None and old_ngt.get("changeAmt") is not None:
+                            result["kospi200_night"] = old_ngt
+                            return result
+
                     current_price = latest_night_from_file
                     prev_price = round(float(night_data[-2]['price']), 2) if len(night_data) >= 2 else latest_night_from_file
-                
+
                 change_base_price = futures_price_ref if futures_price_ref is not None else prev_price
+                if change_base_price and abs(current_price - change_base_price) / change_base_price > 0.15:
+                    change_base_price = prev_price
+
                 night_change = round(current_price - change_base_price, 2)
                 night_pct = round((night_change / change_base_price) * 100, 2) if change_base_price != 0 else 0.0
                 
