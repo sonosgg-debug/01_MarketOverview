@@ -289,16 +289,56 @@ def update_krx_cache_json(updates: dict):
         except Exception as e:
             print(f"Error updating krx_cache.json: {e}")
 
-def get_latest_expected_kofia_date() -> str:
-    """Returns the expected latest available KOFIA date (trading day with T+2 settlement lag)."""
+def get_latest_expected_kofia_date(now_kst=None) -> str:
+    """
+    Returns the expected latest available KOFIA date (YYYY-MM-DD).
+    KOFIA FreeSIS publishes trading day T statistics on trading day T+1 around 16:00~18:00 KST.
+    - Trading day T before 18:00 KST: latest available is T-2 trading day (e.g. Friday on Tuesday morning).
+    - Trading day T after 18:00 KST: latest available is T-1 trading day (e.g. Monday on Tuesday evening).
+    - Non-trading days (weekend/holiday): latest available is the last completed trading day (e.g. Friday).
+    """
+    if now_kst is None:
+        now_kst = datetime.now(KST)
     trading_days = get_krx_trading_days(30)
-    now_kst = datetime.now(KST)
     today_str = now_kst.strftime('%Y%m%d')
+    is_trading_day = is_krx_trading_day(today_str)
     past_days = [d for d in trading_days if d < today_str]
-    if len(past_days) >= 2:
-        d_res = past_days[-2]
-        return f"{d_res[:4]}-{d_res[4:6]}-{d_res[6:]}"
-    return past_days[-1] if past_days else ""
+    if not past_days:
+        return ""
+
+    if is_trading_day:
+        if now_kst.hour >= 18:
+            d_res = past_days[-1]
+        else:
+            d_res = past_days[-2] if len(past_days) >= 2 else past_days[-1]
+    else:
+        d_res = past_days[-1]
+
+    return f"{d_res[:4]}-{d_res[4:6]}-{d_res[6:]}"
+
+def get_latest_expected_night_date(now_kst=None) -> str:
+    """
+    Returns the expected date (YYYY-MM-DD) of the latest completed or active KOSPI200 night futures session.
+    Trading session schedule: 18:00 KST (Day T) ~ 06:00 KST (Day T+1).
+    - Tue ~ Fri (06:00 ~ 23:59 KST): Night session ended at 06:00 KST this morning, date is today YYYY-MM-DD.
+    - Sat: Friday night session ended at 06:00 KST Saturday morning, date is Saturday (or Friday).
+    - Sun or Mon (< 18:00 KST): Latest closed session was Friday's session.
+    - Mon (>= 18:00 KST) or Tue~Fri (< 06:00 KST): Night session is currently active, date is today.
+    """
+    if now_kst is None:
+        now_kst = datetime.now(KST)
+    weekday = now_kst.weekday() # 0=Mon, 1=Tue, ..., 4=Fri, 5=Sat, 6=Sun
+    hour = now_kst.hour
+
+    if weekday in (1, 2, 3, 4) and hour >= 6:
+        return now_kst.strftime("%Y-%m-%d")
+    if weekday == 5:
+        return now_kst.strftime("%Y-%m-%d")
+    if weekday == 6 or (weekday == 0 and hour < 18):
+        days_to_fri = (weekday - 4) if weekday == 6 else 3
+        fri = now_kst - timedelta(days=days_to_fri)
+        return fri.strftime("%Y-%m-%d")
+    return now_kst.strftime("%Y-%m-%d")
 
 def trigger_krx_background_update(wait=False):
     """Backward compatibility wrapper - runs fast update if requested."""
@@ -1450,7 +1490,7 @@ def _estimate_night_futures_fallback(existing_item, futures_item, history, targe
         return None
 
 
-def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
+def fetch_kospi200_night_direct(existing_item=None, futures_item=None, force=False):
     """
     Fetch real-time KOSPI200 Night Futures data directly from eSignal API.
     Provides live quotes and maintains date-aligned history.
@@ -1629,6 +1669,8 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
 
     # Fallback Pipeline when eSignal is unreachable (Cloudflare WAF / 403 on cloud servers)
     try:
+        expected_night_date = get_latest_expected_night_date()
+
         # 1. Check local history file
         history = []
         night_path = os.path.join(os.path.dirname(__file__), "data", "kospif_ngt_history.json")
@@ -1652,17 +1694,58 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
         if not history and existing_item and "history" in existing_item:
             history = list(existing_item["history"])
 
-        # 2. Check if existing_item is already fresh and complete
-        if existing_item and existing_item.get("price") and existing_item.get("trade_date"):
-            if file_latest_date is None or existing_item.get("trade_date") >= file_latest_date:
+        # 2. Check if existing_item is already fresh and aligned with expected_night_date
+        if not force and existing_item and existing_item.get("price") and existing_item.get("trade_date"):
+            if existing_item.get("trade_date") >= expected_night_date:
                 # Ensure existing_item has history
                 if not existing_item.get("history") and history:
                     existing_item["history"] = history
                 return existing_item
 
-        # 3. Check if krx_cache.json has valid data
+        # 3. Check if local history file already has fresh data (e.g. synced from local PC where eSignal succeeded)
+        if file_latest_date and file_latest_price and file_latest_date >= expected_night_date:
+            prev_p = history[-2]["value"] if len(history) >= 2 else file_latest_price
+            chg = round(file_latest_price - prev_p, 2)
+            pct = round((chg / prev_p) * 100, 2) if prev_p else 0.0
+            meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
+            result_item = {
+                "ticker": "KOSPI200_NIGHT",
+                "name": meta.get("name", "KOSPI200 야간 선물 지수"),
+                "price": file_latest_price,
+                "change_amt": chg,
+                "change_percent": pct,
+                "open": file_latest_price,
+                "high": file_latest_price,
+                "low": file_latest_price,
+                "close": file_latest_price,
+                "history": history,
+                "negative_favorable": meta.get("negative_favorable", False),
+                "is_integer_only": False,
+                "is_percent": False,
+                "trade_date": file_latest_date
+            }
+            # Update krx_cache.json in background so cache stays aligned
+            try:
+                hist_iso = [{"date": f"{h['date']}T00:00:00.000Z", "value": h['value']} for h in history]
+                update_krx_cache_json({
+                    "kospi200_night": {
+                        "price": file_latest_price,
+                        "changeAmt": chg,
+                        "changePercent": pct,
+                        "open": file_latest_price,
+                        "high": file_latest_price,
+                        "low": file_latest_price,
+                        "close": file_latest_price,
+                        "history": hist_iso
+                    }
+                })
+            except Exception:
+                pass
+            return result_item
+
+        # 4. Check if krx_cache.json has valid, fresh data
         cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
-        if os.path.exists(cache_path):
+        if not force and os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     c_data = json.load(f)
@@ -1670,7 +1753,7 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
                 if c_ngt and c_ngt.get("price") and c_ngt.get("changeAmt") is not None:
                     c_hist = c_ngt.get("history", [])
                     c_date = c_hist[-1]["date"][:10] if c_hist else None
-                    if file_latest_date is None or (c_date and c_date >= file_latest_date):
+                    if c_date and c_date >= expected_night_date:
                         meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
                         converted_hist = [{"date": h["date"][:10], "value": h["value"]} for h in c_hist if "date" in h]
                         return {
@@ -1692,7 +1775,13 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
             except Exception:
                 pass
 
-        # 4. If history file is available, reconstruct from history file
+        # 5. Statistical EWY fallback if live/cached data is older than expected_night_date
+        target_date = expected_night_date
+        est_item = _estimate_night_futures_fallback(existing_item, futures_item, history, target_date)
+        if est_item:
+            return est_item
+
+        # 6. If EWY fallback failed, return history file point or existing_item as last resort
         if file_latest_date and file_latest_price:
             prev_p = history[-2]["value"] if len(history) >= 2 else file_latest_price
             chg = round(file_latest_price - prev_p, 2)
@@ -1714,13 +1803,6 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None):
                 "is_percent": False,
                 "trade_date": file_latest_date
             }
-
-        # 5. Statistical EWY fallback if all else fails
-        now_kst = datetime.now(timezone(timedelta(hours=9)))
-        target_date = now_kst.strftime("%Y-%m-%d")
-        est_item = _estimate_night_futures_fallback(existing_item, futures_item, history, target_date)
-        if est_item:
-            return est_item
     except Exception as e_fb:
         print(f"[KOSPI200_NIGHT] Error in fallback pipeline: {e_fb}")
 
@@ -2024,7 +2106,8 @@ def fetch_all_market_data(force_refresh=False, wait_for_krx=False):
     # 3e. Fetch KOSPI200 Night Futures dynamically from eSignal API
     night_item = fetch_kospi200_night_direct(
         existing_item=all_data.get("KOSPI200_NIGHT"),
-        futures_item=all_data.get("KOSPI200_FUTURES")
+        futures_item=all_data.get("KOSPI200_FUTURES"),
+        force=force_refresh
     )
     if night_item:
         all_data["KOSPI200_NIGHT"] = night_item

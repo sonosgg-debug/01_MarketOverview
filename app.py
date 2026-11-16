@@ -598,7 +598,7 @@ elif "Semi" in active_sector or "반도체" in active_sector or active_sector ==
 elif "KRX" in active_sector or "한국" in active_sector or active_sector == "K Market":
     market_note = (
         '<div style="text-align: center; font-size: 12.5px; color: #94a3b8; margin-top: 4px;">'
-        '* 주가지수·선물은 실시간/당일 정규장 마감 기준이며, 고객예탁금·신용잔고·반대매매는 금융투자협회(KOFIA) 공식 결제 공시(T+2 집계) 기준입니다.'
+        '* 주가지수·선물(주간/야간)은 정규 마감 기준이며, 고객예탁금·신용잔고·반대매매는 금융투자협회(KOFIA) 공식 공시(영업일 18시 공시, 전영업일 결제 집계) 기준입니다.'
         '</div>'
     )
 
