@@ -1817,6 +1817,59 @@ def is_valid_num(val):
     except (ValueError, TypeError):
         return False
 
+def fetch_naver_overseas_history(ticker, max_pages=3):
+    """
+    Fetch overseas stock price history from Naver Mobile/PC API.
+    Used as an enrichment fallback when Yahoo Finance daily history is truncated or missing
+    (e.g. corporate actions, stock splits like SNDK, or API outages).
+    Supports NASDAQ (.O), NYSE (.N), AMEX (.A), and bare ticker.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    suffixes = [".O", ".N", ".A", ""]
+    items = []
+    found_code = None
+    for suf in suffixes:
+        code = f"{ticker}{suf}"
+        try:
+            url = f"https://api.stock.naver.com/stock/{code}/price?pageSize=60&page=1"
+            r = requests.get(url, headers=headers, timeout=4)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and len(data) > 0 and "closePrice" in data[0]:
+                    items.extend(data)
+                    found_code = code
+                    break
+        except Exception:
+            continue
+
+    if not found_code:
+        return []
+
+    for p in range(2, max_pages + 1):
+        try:
+            url = f"https://api.stock.naver.com/stock/{found_code}/price?pageSize=60&page={p}"
+            r = requests.get(url, headers=headers, timeout=4)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and len(data) > 0:
+                    items.extend(data)
+                else:
+                    break
+            else:
+                break
+        except Exception:
+            break
+
+    history = []
+    for x in reversed(items):
+        try:
+            d = x["localTradedAt"][:10]
+            val = round(float(x["closePrice"].replace(",", "")), 4)
+            history.append({"date": d, "value": val})
+        except Exception:
+            pass
+    return history
+
 def fetch_yahoo_bulk(tickers):
     """
     Fetch real-time quotes and daily OHLCV history for multiple tickers via yfinance.
@@ -1927,6 +1980,19 @@ def fetch_yahoo_bulk(tickers):
                     if is_valid_num(row.get("Close"))
                 ]
 
+            # Yahoo Finance의 히스토리가 비정상적으로 누락/단절된 경우 (예: SNDK 주식분할 등의 이슈로 30개 미만)
+            # 네이버 해외주식 시세 API에서 과거 시세를 조회하여 보강
+            if len(history) < 30 and not ticker.startswith("^") and not ticker.endswith(".KS") and not ticker.endswith(".KQ"):
+                naver_hist = fetch_naver_overseas_history(ticker, max_pages=3)
+                if len(naver_hist) > len(history):
+                    naver_date_set = {h["date"] for h in naver_hist}
+                    merged = list(naver_hist)
+                    for h in history:
+                        if h["date"] not in naver_date_set:
+                            merged.append(h)
+                    merged.sort(key=lambda x: x["date"])
+                    history = merged
+
             price = None
             prev_close = None
             open_val = None
@@ -1981,6 +2047,14 @@ def fetch_yahoo_bulk(tickers):
                     open_val = float(latest_row["Open"]) if "Open" in latest_row and is_valid_num(latest_row["Open"]) else price
                     high_val = float(latest_row["High"]) if "High" in latest_row and is_valid_num(latest_row["High"]) else price
                     low_val = float(latest_row["Low"]) if "Low" in latest_row and is_valid_num(latest_row["Low"]) else price
+
+            # Fallback to enriched history if price is still missing
+            if (not is_valid_num(price)) and history:
+                price = float(history[-1]["value"])
+                prev_close = float(history[-2]["value"]) if len(history) >= 2 else price
+                open_val = open_val or price
+                high_val = high_val or price
+                low_val = low_val or price
 
             if not is_valid_num(price):
                 continue

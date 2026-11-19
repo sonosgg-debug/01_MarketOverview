@@ -16,7 +16,7 @@ K_MARKET_TICKERS = [
 ]
 
 SEMI_MARKET_TICKERS = [
-    '^SOX', 'NVDA', 'MU', 'SNDK', 'INTC', 'AMD', 'PLTR', 'ORCL', 'AVGO', 'NBIS', 'CRWV', 'DRAM', 'CCML', 'AIQ', 'BAI',
+    '^SOX', 'ANT', 'NVDA', 'MU', 'SNDK', 'INTC', 'AMD', 'PLTR', 'ORCL', 'AVGO', 'NBIS', 'CRWV', 'DRAM', 'CCML', 'AIQ', 'BAI',
     '005930.KS', '009150.KS', '402340.KS', '000660.KS', 'SKHY', '285A.T', '6981.T', '688825.SS'
 ]
 
@@ -79,6 +79,7 @@ INDICATORS_META = {
 
     # AI & Semiconductor
     '^SOX': {'name': '필라델피아 반도체 지수(SOX)', 'negative_favorable': False},
+    'ANT': {'name': '앤트로픽(ANT)', 'negative_favorable': False},
     'NVDA': {'name': '엔비디아(NVDA)', 'negative_favorable': False},
     'MU': {'name': '마이크론(MU)', 'negative_favorable': False},
     'SNDK': {'name': '샌디스크(SNDK)', 'negative_favorable': False},

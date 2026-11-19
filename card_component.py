@@ -44,11 +44,22 @@ def render_daily_candle_svg(o, h, l, c):
 
 def render_sparkline_svg(history, is_odd=True, is_int=False, is_percent=False):
     """Generate inline SVG sparkline with 50% opacity interactive hover tooltip (60-day trend)."""
-    if not history or len(history) < 2:
+    if not history:
         return '<div style="width:165px; height:44px; display:flex; align-items:center; justify-content:flex-end; font-size:11px; color:#71717a;">No data</div>'
 
     valid_items = [h for h in history if h.get("value") is not None]
     if len(valid_items) < 2:
+        if len(valid_items) == 1:
+            raw_date = str(valid_items[0].get("date", "")).split("T")[0]
+            v = float(valid_items[0]["value"])
+            fmt_v = f"{v:,.2f}" if not is_int else f"{int(round(v)):,}"
+            return (
+                f'<div style="width:165px; height:44px; display:flex; align-items:center; justify-content:flex-end;">'
+                f'<span title="{raw_date}: {fmt_v}" style="font-size:11px; font-weight:500; color:#38bdf8; background:rgba(56,189,248,0.12); padding:3px 8px; border-radius:5px; border:1px solid rgba(56,189,248,0.3);">'
+                f'신규 상장 (1일차)'
+                f'</span>'
+                f'</div>'
+            )
         return '<div style="width:165px; height:44px; display:flex; align-items:center; justify-content:flex-end; font-size:11px; color:#71717a;">No data</div>'
 
     # Display the most recent 60 trading days for the 60-day trendline
