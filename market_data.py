@@ -1443,47 +1443,8 @@ def _estimate_night_futures_fallback(existing_item, futures_item, history, targe
             "is_estimated": True
         }
 
-        # Save to local files
-        try:
-            night_path = os.path.join(os.path.dirname(__file__), "data", "kospif_ngt_history.json")
-            if os.path.exists(night_path):
-                with open(night_path, "r", encoding="utf-8") as f:
-                    file_data = json.load(f)
-                f_dates = {x["date"]: x for x in file_data}
-                if target_date in f_dates:
-                    f_dates[target_date]["price"] = est_close
-                else:
-                    file_data.append({"date": target_date, "price": est_close})
-                file_data.sort(key=lambda x: x["date"])
-                file_data = file_data[-200:]
-                with open(night_path, "w", encoding="utf-8") as f:
-                    json.dump(file_data, f, indent=4, ensure_ascii=False)
-        except Exception:
-            pass
-
-        try:
-            cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
-            if os.path.exists(cache_path):
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    c_data = json.load(f)
-                if isinstance(c_data, dict):
-                    hist_iso = [{"date": f"{h['date']}T00:00:00.000Z", "value": h['value']} for h in updated_history]
-                    c_data["kospi200_night"] = {
-                        "price": est_close,
-                        "changeAmt": est_change,
-                        "changePercent": est_pct,
-                        "open": est_close,
-                        "high": est_close,
-                        "low": est_close,
-                        "close": est_close,
-                        "history": hist_iso
-                    }
-                    with open(cache_path, "w", encoding="utf-8") as f:
-                        json.dump(c_data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-        print(f"[KOSPI200_NIGHT] EWY-correlated fallback generated: {est_close} ({est_change:+.2f}, {est_pct:+.2f}%) for {target_date}")
+        # Do NOT save statistical estimates to ground truth history files to prevent data corruption.
+        print(f"[KOSPI200_NIGHT] EWY-correlated fallback generated (in-memory only): {est_close} ({est_change:+.2f}, {est_pct:+.2f}%) for {target_date}")
         return result_item
     except Exception as e_est:
         print(f"[KOSPI200_NIGHT] Error in EWY fallback estimation: {e_est}")
@@ -1775,13 +1736,8 @@ def fetch_kospi200_night_direct(existing_item=None, futures_item=None, force=Fal
             except Exception:
                 pass
 
-        # 5. Statistical EWY fallback if live/cached data is older than expected_night_date
-        target_date = expected_night_date
-        est_item = _estimate_night_futures_fallback(existing_item, futures_item, history, target_date)
-        if est_item:
-            return est_item
-
-        # 6. If EWY fallback failed, return history file point or existing_item as last resort
+        # 5. If live eSignal is blocked (e.g. Cloudflare WAF) and no fresh session in file,
+        # fall back to the latest confirmed historical session data rather than fabricating an unreliable EWY estimate.
         if file_latest_date and file_latest_price:
             prev_p = history[-2]["value"] if len(history) >= 2 else file_latest_price
             chg = round(file_latest_price - prev_p, 2)
