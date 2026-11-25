@@ -1372,397 +1372,353 @@ def fetch_kofia_stats_direct(existing_dep=None, existing_cred=None, existing_liq
         return fallback
 
 
-def _estimate_night_futures_fallback(existing_item, futures_item, history, target_date):
-    """
-    Statistical fallback for KOSPI200 Night Futures when eSignal API is blocked (e.g. Cloudflare WAF on cloud datacenter IPs).
-    Calculates estimated night futures move using EWY (iShares MSCI South Korea ETF) overnight session return:
-    F_night = F_day * (1 + R_EWY)
-    """
+def get_kis_access_token():
+    """Retrieve or refresh KIS Developers API access token with local file caching and 24h validity."""
+    app_key = os.getenv("KIS_APP_KEY")
+    app_secret = os.getenv("KIS_APP_SECRET")
+    if not app_key or not app_secret:
+        try:
+            import streamlit as _st
+            if hasattr(_st, "secrets"):
+                app_key = app_key or _st.secrets.get("KIS_APP_KEY")
+                app_secret = app_secret or _st.secrets.get("KIS_APP_SECRET")
+        except Exception:
+            pass
+    if not app_key or not app_secret:
+        return None
+
+    token_file = os.path.join(os.path.dirname(__file__), "data", "kis_token.json")
+    if os.path.exists(token_file):
+        try:
+            with open(token_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            import time as _t
+            if cached.get("expires_at", 0) > _t.time() + 300 and cached.get("access_token"):
+                return cached["access_token"]
+        except Exception as e:
+            print(f"[KIS] Token cache read error: {e}")
+
     try:
-        import yfinance as yf
-        t = yf.Ticker("EWY")
-        fi = t.fast_info
-        last_p = getattr(fi, "last_price", None)
-        prev_p = getattr(fi, "previous_close", None)
-        if not (last_p and prev_p and prev_p > 0):
-            return None
+        import time as _t
+        url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
+        payload = {
+            "grant_type": "client_credentials",
+            "appkey": app_key,
+            "appsecret": app_secret
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        data = resp.json()
+        if resp.status_code == 200 and "access_token" in data:
+            token = data["access_token"]
+            expires_in = data.get("expires_in", 86400)
+            cache_data = {
+                "access_token": token,
+                "token_type": data.get("token_type", "Bearer"),
+                "expires_at": _t.time() + expires_in
+            }
+            os.makedirs(os.path.dirname(token_file), exist_ok=True)
+            with open(token_file, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f)
+            print("[KIS] New access token issued and cached successfully.")
+            return token
+        else:
+            print(f"[KIS] Token issuance failed: {resp.status_code} {data.get('error_description')}")
+    except Exception as e:
+        print(f"[KIS] Token request error: {e}")
+    return None
 
-        ewy_ret = (last_p - prev_p) / prev_p
 
-        # Determine daytime futures base price
-        base_p = None
-        if futures_item and isinstance(futures_item, dict):
-            base_p = futures_item.get("price")
-        if base_p is None:
+def fetch_kis_future_quote():
+    """Fetch domestic futures quotation from KIS Developers API."""
+    token = get_kis_access_token()
+    if not token:
+        return None
+    try:
+        app_key = os.getenv("KIS_APP_KEY")
+        app_secret = os.getenv("KIS_APP_SECRET")
+        if not app_key or not app_secret:
             try:
-                f_live = fetch_naver_price("KOSPI200_FUTURES")
-                if f_live and f_live.get("price"):
-                    base_p = float(f_live["price"])
+                import streamlit as _st
+                if hasattr(_st, "secrets"):
+                    app_key = app_key or _st.secrets.get("KIS_APP_KEY")
+                    app_secret = app_secret or _st.secrets.get("KIS_APP_SECRET")
             except Exception:
                 pass
-        if base_p is None and history:
-            base_p = float(history[-1]["value"])
-        if base_p is None and existing_item and existing_item.get("price"):
-            base_p = float(existing_item["price"])
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {token}",
+            "appkey": app_key,
+            "appsecret": app_secret,
+            "tr_id": "FHMIF10000000"
+        }
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "F",
+            "FID_INPUT_ISCD": "10100"
+        }
+        r = requests.get(
+            "https://openapi.koreainvestment.com:9443/uapi/domestic-futureoption/v1/quotations/inquire-price",
+            headers=headers,
+            params=params,
+            timeout=5
+        )
+        if r.status_code == 200:
+            data = r.json()
+            out = data.get("output1", {})
+            prpr = float(out.get("futs_prpr", 0) or 0)
+            if prpr > 0:
+                oprc = float(out.get("futs_oprc", 0) or prpr)
+                hgpr = float(out.get("futs_hgpr", 0) or prpr)
+                lwpr = float(out.get("futs_lwpr", 0) or prpr)
+                clpr = float(out.get("futs_prdy_clpr", 0) or prpr)
+                diff = float(out.get("futs_prdy_vrss", 0) or 0)
+                rate = float(out.get("futs_prdy_ctrt", 0) or 0)
+                return {
+                    "price": prpr,
+                    "open": oprc if oprc > 0 else prpr,
+                    "high": hgpr if hgpr > 0 else prpr,
+                    "low": lwpr if lwpr > 0 else prpr,
+                    "close": prpr,
+                    "prev_close": clpr,
+                    "change": diff,
+                    "change_pct": rate,
+                    "source": "KIS"
+                }
+    except Exception as e:
+        print(f"[KIS] Quote fetch error: {e}")
+    return None
 
-        if not base_p:
+
+def fetch_prekospi_night_session():
+    """Fetch live/most recent KRX KOSPI200 Night Futures session data from PreKOSPI."""
+    try:
+        url = "https://www.prekospi.com"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200:
+            return None
+        text = resp.text
+
+        start = text.find(r'\"futures\":')
+        if start == -1:
             return None
 
-        est_close = round(base_p * (1.0 + ewy_ret), 2)
-        est_change = round(est_close - base_p, 2)
-        est_pct = round(ewy_ret * 100.0, 2)
+        sub = text[start + len(r'\"futures\":'):]
+        sub_unescaped = sub.replace(r'\"', '"').replace(r'\\', '\\')
 
-        # Update history
-        updated_history = list(history) if history else []
-        if updated_history:
-            last_date = updated_history[-1]["date"]
-            if target_date > last_date:
-                updated_history.append({"date": target_date, "value": est_close})
-            elif target_date == last_date:
-                updated_history[-1]["value"] = est_close
+        dec = json.JSONDecoder()
+        obj, _ = dec.raw_decode(sub_unescaped)
+
+        price = float(obj.get("price", 0))
+        if price <= 0:
+            return None
+
+        open_p = float(obj.get("open", price))
+        high_p = float(obj.get("high", price))
+        low_p = float(obj.get("low", price))
+
+        sess = obj.get("session", {})
+        day_close = float(sess.get("dayClose", 0)) or float(obj.get("prevClose", price))
+
+        if day_close > 0:
+            change_amt = round(price - day_close, 2)
+            change_pct = round((change_amt / day_close) * 100, 2)
         else:
-            updated_history.append({"date": target_date, "value": est_close})
-        updated_history = updated_history[-200:]
+            change_amt = round(price - open_p, 2)
+            change_pct = round((change_amt / open_p) * 100, 2) if open_p else 0.0
 
-        meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
-        result_item = {
-            "ticker": "KOSPI200_NIGHT",
-            "name": meta.get("name", "KOSPI200 야간 선물 지수"),
-            "price": est_close,
-            "change_amt": est_change,
-            "change_percent": est_pct,
-            "open": est_close,
-            "high": est_close,
-            "low": est_close,
-            "close": est_close,
-            "history": updated_history,
-            "negative_favorable": meta.get("negative_favorable", False),
-            "is_integer_only": False,
-            "is_percent": False,
-            "trade_date": target_date,
-            "is_estimated": True
+        kst = timezone(timedelta(hours=9))
+        now_kst = datetime.now(kst)
+        if now_kst.hour < 18:
+            trade_date = now_kst.strftime("%Y-%m-%d")
+        else:
+            trade_date = (now_kst + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        return {
+            "price": price,
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": price,
+            "day_close": day_close,
+            "change_amt": change_amt,
+            "change_percent": change_pct,
+            "trade_date": trade_date,
+            "source": "KRX_NIGHT"
         }
-
-        # Do NOT save statistical estimates to ground truth history files to prevent data corruption.
-        print(f"[KOSPI200_NIGHT] EWY-correlated fallback generated (in-memory only): {est_close} ({est_change:+.2f}, {est_pct:+.2f}%) for {target_date}")
-        return result_item
-    except Exception as e_est:
-        print(f"[KOSPI200_NIGHT] Error in EWY fallback estimation: {e_est}")
+    except Exception as e:
+        print(f"[KOSPI200_NIGHT] PreKOSPI fetch error: {e}")
         return None
 
 
 def fetch_kospi200_night_direct(existing_item=None, futures_item=None, force=False):
     """
-    Fetch real-time KOSPI200 Night Futures data directly from eSignal API.
-    Provides live quotes and maintains date-aligned history.
-    Gracefully falls back to existing_item (from krx_cache.json) or EWY-correlated estimation if unavailable/blocked by Cloudflare.
+    Fetch reliable KOSPI200 Night Futures data with OHLC candle integrity.
+    Primary: Live KRX Night Session feed (PreKOSPI) providing full session OHLC.
+    Secondary: Official KIS Developers API quote (inquire-price).
+    Tertiary: Local confirmed ground-truth history from data/kospif_ngt_history.json.
+    Never fabricates unverified synthetic estimates.
     """
-    try:
-        import time as _time
-        url = f"https://esignal.co.kr/data/cache/kospif_ngt.js?_={int(_time.time() * 1000)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://esignal.co.kr/kospi200-futures-night/"
-        }
-        res = None
+    # 1. Load ground truth history from file
+    history = []
+    night_path = os.path.join(os.path.dirname(__file__), "data", "kospif_ngt_history.json")
+    file_latest_date = None
+    file_latest_price = None
+    if os.path.exists(night_path):
         try:
-            res = requests.get(url, headers=headers, timeout=5)
-        except Exception as e_req:
-            print(f"[KOSPI200_NIGHT] eSignal request error: {e_req}")
+            with open(night_path, "r", encoding="utf-8") as f:
+                raw_file_hist = json.load(f)
+                for item in raw_file_hist:
+                    d = item.get("date")
+                    p = item.get("price")
+                    if d and p is not None:
+                        history.append({"date": d, "value": round(float(p), 2)})
+                if raw_file_hist:
+                    file_latest_date = raw_file_hist[-1].get("date")
+                    file_latest_price = round(float(raw_file_hist[-1].get("price")), 2)
+        except Exception as e:
+            print(f"[KOSPI200_NIGHT] Failed to read {night_path}: {e}")
 
-        if res and res.status_code == 200:
-            cdata = res.json()
-            pts = cdata.get("data", [])
-            if pts:
-                prices = [float(p[1]) for p in pts]
-                open_p = float(cdata.get("open", prices[0]))
-                high_p = max(prices)
-                low_p = min(prices)
-                close_p = prices[-1]
+    if not history and existing_item and "history" in existing_item:
+        history = list(existing_item["history"])
 
-                from datetime import timezone
-                kst = timezone(timedelta(hours=9))
-                ts_first = pts[0][0] / 1000.0
-                ts_last = pts[-1][0] / 1000.0
-                session_start_date = datetime.fromtimestamp(ts_first, kst).strftime("%Y-%m-%d")
-                session_end_date = datetime.fromtimestamp(ts_last, kst).strftime("%Y-%m-%d")
+    live_data = None
 
-                # Reference price for change calculation:
-                # Night futures change is officially compared to daytime futures close of session_start_date.
-                change_base_price = None
-                if futures_item and isinstance(futures_item, dict):
-                    f_hist = futures_item.get("history", [])
-                    for h in reversed(f_hist):
-                        if h.get("date") == session_start_date:
-                            change_base_price = float(h.get("value"))
-                            break
-                    if change_base_price is None and futures_item.get("trade_date") == session_start_date:
-                        change_base_price = float(futures_item.get("price"))
-
-                # Fallback to querying Naver daytime futures if still None
-                if change_base_price is None:
-                    try:
-                        f_live = fetch_naver_price("KOSPI200_FUTURES")
-                        if f_live and f_live.get("history"):
-                            for h in reversed(f_live["history"]):
-                                if h.get("date") == session_start_date:
-                                    change_base_price = float(h.get("value"))
-                                    break
-                            if change_base_price is None and f_live.get("price") and f_live.get("trade_date") == session_start_date:
-                                change_base_price = float(f_live["price"])
-                    except Exception:
-                        pass
-
-                # Load history from existing_item or local file
-                history = []
-                night_path = os.path.join(os.path.dirname(__file__), "data", "kospif_ngt_history.json")
-                if os.path.exists(night_path):
-                    try:
-                        with open(night_path, "r", encoding="utf-8") as f:
-                            raw_file_hist = json.load(f)
-                            for item in raw_file_hist:
-                                d = item.get("date")
-                                p = item.get("price")
-                                if d and p is not None:
-                                    history.append({"date": d, "value": round(float(p), 2)})
-                    except Exception:
-                        pass
-
-                if not history and existing_item and "history" in existing_item:
-                    history = list(existing_item["history"])
-
-                # Determine fallback change_base_price if still None
-                if change_base_price is None:
-                    if len(history) >= 2 and history[-1]["date"] == session_end_date:
-                        change_base_price = history[-2]["value"]
-                    elif history:
-                        change_base_price = history[-1]["value"]
-                    else:
-                        change_base_price = open_p
-
-                # Sanity guard: if change_base_price differs by > 15%, prevent extreme distortion
-                if change_base_price and abs(close_p - change_base_price) / change_base_price > 0.15:
-                    print(f"[KOSPI200_NIGHT] Guard triggered: anomalous base price {change_base_price} for close {close_p}. Falling back to open {open_p}.")
-                    change_base_price = open_p
-
-                # Update history with current session
-                if history:
-                    last_hist_date = history[-1]["date"]
-                    if session_end_date > last_hist_date:
-                        history.append({"date": session_end_date, "value": round(close_p, 2)})
-                    elif session_end_date == last_hist_date:
-                        history[-1]["value"] = round(close_p, 2)
-                else:
-                    history.append({"date": session_end_date, "value": round(close_p, 2)})
-
-                history = history[-200:]
-
-                # Save updated point back to file if possible
-                if os.path.exists(night_path):
-                    try:
-                        with open(night_path, "r", encoding="utf-8") as f:
-                            file_data = json.load(f)
-                        f_dates = {x["date"]: x for x in file_data}
-                        if session_end_date in f_dates:
-                            f_dates[session_end_date]["price"] = round(close_p, 2)
-                        else:
-                            file_data.append({"date": session_end_date, "price": round(close_p, 2)})
-                        file_data.sort(key=lambda x: x["date"])
-                        file_data = file_data[-200:]
-                        with open(night_path, "w", encoding="utf-8") as f:
-                            json.dump(file_data, f, indent=4, ensure_ascii=False)
-                    except Exception:
-                        pass
-
-                night_change = round(close_p - change_base_price, 2)
-                night_pct = round((night_change / change_base_price) * 100, 2) if change_base_price else 0.0
-
-                meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
-                result_item = {
-                    "ticker": "KOSPI200_NIGHT",
-                    "name": meta.get("name", "KOSPI200 야간 선물 지수"),
-                    "price": round(close_p, 2),
-                    "change_amt": night_change,
-                    "change_percent": night_pct,
-                    "open": round(open_p, 2),
-                    "high": round(high_p, 2),
-                    "low": round(low_p, 2),
-                    "close": round(close_p, 2),
-                    "history": history,
-                    "negative_favorable": meta.get("negative_favorable", False),
-                    "is_integer_only": False,
-                    "is_percent": False,
-                    "trade_date": session_end_date
-                }
-
-                # Update krx_cache.json in background so cache file stays fresh
-                try:
-                    script_dir = os.path.dirname(os.path.abspath(__file__))
-                    cache_path = os.path.join(script_dir, "krx_cache.json")
-                    if os.path.exists(cache_path):
-                        with open(cache_path, "r", encoding="utf-8") as f:
-                            c_data = json.load(f)
-                        if isinstance(c_data, dict):
-                            hist_iso = [{"date": f"{h['date']}T00:00:00.000Z", "value": h['value']} for h in history]
-                            c_data["kospi200_night"] = {
-                                "price": round(close_p, 2),
-                                "changeAmt": night_change,
-                                "changePercent": night_pct,
-                                "open": round(open_p, 2),
-                                "high": round(high_p, 2),
-                                "low": round(low_p, 2),
-                                "close": round(close_p, 2),
-                                "history": hist_iso
-                            }
-                            with open(cache_path, "w", encoding="utf-8") as f:
-                                json.dump(c_data, f, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
-
-                return result_item
-        else:
-            status_desc = res.status_code if res else "network error"
-            print(f"[KOSPI200_NIGHT] eSignal returned {status_desc} (Cloudflare WAF on datacenter IP or network issue). Entering fallback pipeline.")
-    except Exception as e:
-        print(f"Error in fetch_kospi200_night_direct: {e}")
-
-    # Fallback Pipeline when eSignal is unreachable (Cloudflare WAF / 403 on cloud servers)
+    # Step A: Attempt KRX Night Session Feed (PreKOSPI)
     try:
-        expected_night_date = get_latest_expected_night_date()
+        live_data = fetch_prekospi_night_session()
+        if live_data:
+            print(f"[KOSPI200_NIGHT] Fetched from KRX Night Session Feed: {live_data['price']} ({live_data['change_amt']:+.2f}, {live_data['change_percent']:+.2f}%)")
+    except Exception as e:
+        print(f"[KOSPI200_NIGHT] Error querying night feed: {e}")
 
-        # 1. Check local history file
-        history = []
-        night_path = os.path.join(os.path.dirname(__file__), "data", "kospif_ngt_history.json")
-        file_latest_date = None
-        file_latest_price = None
+    # Step B: If night session feed unavailable, query KIS Developers API
+    if not live_data:
+        try:
+            kis_quote = fetch_kis_future_quote()
+            if kis_quote:
+                kst = timezone(timedelta(hours=9))
+                t_date = datetime.now(kst).strftime("%Y-%m-%d")
+                live_data = {
+                    "price": kis_quote["price"],
+                    "open": kis_quote["open"],
+                    "high": kis_quote["high"],
+                    "low": kis_quote["low"],
+                    "close": kis_quote["close"],
+                    "change_amt": kis_quote["change"],
+                    "change_percent": kis_quote["change_pct"],
+                    "trade_date": t_date,
+                    "source": "KIS"
+                }
+                print(f"[KOSPI200_NIGHT] Fetched from KIS Developers API: {live_data['price']} ({live_data['change_amt']:+.2f}, {live_data['change_percent']:+.2f}%)")
+        except Exception as e:
+            print(f"[KOSPI200_NIGHT] Error querying KIS API: {e}")
+
+    # If live data was successfully obtained from either primary or secondary:
+    if live_data:
+        p = round(float(live_data["price"]), 2)
+        o = round(float(live_data.get("open", p)), 2)
+        h = round(float(live_data.get("high", p)), 2)
+        l = round(float(live_data.get("low", p)), 2)
+        c = round(float(live_data.get("close", p)), 2)
+        chg = round(float(live_data.get("change_amt", 0.0)), 2)
+        pct = round(float(live_data.get("change_percent", 0.0)), 2)
+        t_date = live_data.get("trade_date", datetime.now().strftime("%Y-%m-%d"))
+
+        # Update history
+        if history:
+            last_hist_date = history[-1]["date"]
+            if t_date > last_hist_date:
+                history.append({"date": t_date, "value": p})
+            elif t_date == last_hist_date:
+                history[-1]["value"] = p
+        else:
+            history.append({"date": t_date, "value": p})
+        history = history[-200:]
+
+        # Save to data/kospif_ngt_history.json
         if os.path.exists(night_path):
             try:
                 with open(night_path, "r", encoding="utf-8") as f:
-                    raw_file_hist = json.load(f)
-                    for item in raw_file_hist:
-                        d = item.get("date")
-                        p = item.get("price")
-                        if d and p is not None:
-                            history.append({"date": d, "value": round(float(p), 2)})
-                    if raw_file_hist:
-                        file_latest_date = raw_file_hist[-1].get("date")
-                        file_latest_price = round(float(raw_file_hist[-1].get("price")), 2)
-            except Exception:
-                pass
+                    file_data = json.load(f)
+                f_dates = {x["date"]: x for x in file_data}
+                if t_date in f_dates:
+                    f_dates[t_date]["price"] = p
+                else:
+                    file_data.append({"date": t_date, "price": p})
+                file_data.sort(key=lambda x: x["date"])
+                file_data = file_data[-200:]
+                with open(night_path, "w", encoding="utf-8") as f:
+                    json.dump(file_data, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                print(f"[KOSPI200_NIGHT] Failed to update {night_path}: {e}")
 
-        if not history and existing_item and "history" in existing_item:
-            history = list(existing_item["history"])
+        # Sync to krx_cache.json
+        try:
+            hist_iso = [{"date": f"{item['date']}T00:00:00.000Z", "value": item["value"]} for item in history]
+            update_krx_cache_json({
+                "kospi200_night": {
+                    "price": p,
+                    "changeAmt": chg,
+                    "changePercent": pct,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "history": hist_iso
+                }
+            })
+        except Exception as e:
+            print(f"[KOSPI200_NIGHT] Failed to sync krx_cache.json: {e}")
 
-        # 2. Check if existing_item is already fresh and aligned with expected_night_date
-        if not force and existing_item and existing_item.get("price") and existing_item.get("trade_date"):
-            if existing_item.get("trade_date") >= expected_night_date:
-                # Ensure existing_item has history
-                if not existing_item.get("history") and history:
-                    existing_item["history"] = history
-                return existing_item
+        meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
+        result_item = {
+            "ticker": "KOSPI200_NIGHT",
+            "name": meta.get("name", "KOSPI200 야간 선물 지수"),
+            "price": p,
+            "change_amt": chg,
+            "change_percent": pct,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "history": history,
+            "negative_favorable": meta.get("negative_favorable", False),
+            "is_integer_only": False,
+            "is_percent": False,
+            "trade_date": t_date,
+            "source": live_data.get("source")
+        }
+        return result_item
 
-        # 3. Check if local history file already has fresh data (e.g. synced from local PC where eSignal succeeded)
-        if file_latest_date and file_latest_price and file_latest_date >= expected_night_date:
-            prev_p = history[-2]["value"] if len(history) >= 2 else file_latest_price
-            chg = round(file_latest_price - prev_p, 2)
-            pct = round((chg / prev_p) * 100, 2) if prev_p else 0.0
-            meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
-            result_item = {
-                "ticker": "KOSPI200_NIGHT",
-                "name": meta.get("name", "KOSPI200 야간 선물 지수"),
-                "price": file_latest_price,
-                "change_amt": chg,
-                "change_percent": pct,
-                "open": file_latest_price,
-                "high": file_latest_price,
-                "low": file_latest_price,
-                "close": file_latest_price,
-                "history": history,
-                "negative_favorable": meta.get("negative_favorable", False),
-                "is_integer_only": False,
-                "is_percent": False,
-                "trade_date": file_latest_date
-            }
-            # Update krx_cache.json in background so cache stays aligned
-            try:
-                hist_iso = [{"date": f"{h['date']}T00:00:00.000Z", "value": h['value']} for h in history]
-                update_krx_cache_json({
-                    "kospi200_night": {
-                        "price": file_latest_price,
-                        "changeAmt": chg,
-                        "changePercent": pct,
-                        "open": file_latest_price,
-                        "high": file_latest_price,
-                        "low": file_latest_price,
-                        "close": file_latest_price,
-                        "history": hist_iso
-                    }
-                })
-            except Exception:
-                pass
-            return result_item
-
-        # 4. Check if krx_cache.json has valid, fresh data
-        cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
-        if not force and os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    c_data = json.load(f)
-                c_ngt = c_data.get("kospi200_night") if isinstance(c_data, dict) else None
-                if c_ngt and c_ngt.get("price") and c_ngt.get("changeAmt") is not None:
-                    c_hist = c_ngt.get("history", [])
-                    c_date = c_hist[-1]["date"][:10] if c_hist else None
-                    if c_date and c_date >= expected_night_date:
-                        meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
-                        converted_hist = [{"date": h["date"][:10], "value": h["value"]} for h in c_hist if "date" in h]
-                        return {
-                            "ticker": "KOSPI200_NIGHT",
-                            "name": meta.get("name", "KOSPI200 야간 선물 지수"),
-                            "price": c_ngt["price"],
-                            "change_amt": c_ngt["changeAmt"],
-                            "change_percent": c_ngt["changePercent"],
-                            "open": c_ngt.get("open", c_ngt["price"]),
-                            "high": c_ngt.get("high", c_ngt["price"]),
-                            "low": c_ngt.get("low", c_ngt["price"]),
-                            "close": c_ngt.get("close", c_ngt["price"]),
-                            "history": converted_hist or history,
-                            "negative_favorable": meta.get("negative_favorable", False),
-                            "is_integer_only": False,
-                            "is_percent": False,
-                            "trade_date": c_date
-                        }
-            except Exception:
-                pass
-
-        # 5. If live eSignal is blocked (e.g. Cloudflare WAF) and no fresh session in file,
-        # fall back to the latest confirmed historical session data rather than fabricating an unreliable EWY estimate.
-        if file_latest_date and file_latest_price:
-            prev_p = history[-2]["value"] if len(history) >= 2 else file_latest_price
-            chg = round(file_latest_price - prev_p, 2)
-            pct = round((chg / prev_p) * 100, 2) if prev_p else 0.0
-            meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
-            return {
-                "ticker": "KOSPI200_NIGHT",
-                "name": meta.get("name", "KOSPI200 야간 선물 지수"),
-                "price": file_latest_price,
-                "change_amt": chg,
-                "change_percent": pct,
-                "open": file_latest_price,
-                "high": file_latest_price,
-                "low": file_latest_price,
-                "close": file_latest_price,
-                "history": history,
-                "negative_favorable": meta.get("negative_favorable", False),
-                "is_integer_only": False,
-                "is_percent": False,
-                "trade_date": file_latest_date
-            }
-    except Exception as e_fb:
-        print(f"[KOSPI200_NIGHT] Error in fallback pipeline: {e_fb}")
+    # Step C: Fallback to confirmed history from file
+    if file_latest_date and file_latest_price:
+        prev_p = history[-2]["value"] if len(history) >= 2 else file_latest_price
+        chg = round(file_latest_price - prev_p, 2)
+        pct = round((chg / prev_p) * 100, 2) if prev_p else 0.0
+        meta = INDICATORS_META.get("KOSPI200_NIGHT", {})
+        return {
+            "ticker": "KOSPI200_NIGHT",
+            "name": meta.get("name", "KOSPI200 야간 선물 지수"),
+            "price": file_latest_price,
+            "change_amt": chg,
+            "change_percent": pct,
+            "open": file_latest_price,
+            "high": file_latest_price,
+            "low": file_latest_price,
+            "close": file_latest_price,
+            "history": history,
+            "negative_favorable": meta.get("negative_favorable", False),
+            "is_integer_only": False,
+            "is_percent": False,
+            "trade_date": file_latest_date,
+            "source": "HISTORY_CACHE"
+        }
 
     return existing_item
+
+
 
 def is_valid_num(val):
     if val is None:
