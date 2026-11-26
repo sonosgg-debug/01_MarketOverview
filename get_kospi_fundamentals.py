@@ -339,14 +339,17 @@ def task_fundamentals(start_date, end_date):
             time.sleep(0.3)
     return result
 
-class KrxMdc(KrxWebIo):
-    @property
-    def bld(self):
-        return 'dbms/MDC/STAT/standard/MDCSTAT01201'
+if KrxWebIo is not None:
+    class KrxMdc(KrxWebIo):
+        @property
+        def bld(self):
+            return 'dbms/MDC/STAT/standard/MDCSTAT01201'
+else:
+    KrxMdc = None
 
 def task_vkospi(start_date, end_date):
     result = {}
-    if KrxWebIo is None:
+    if KrxWebIo is None or KrxMdc is None:
         return result
     try:
         class RobustKrxMdc(KrxMdc):

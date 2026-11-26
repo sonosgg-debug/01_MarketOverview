@@ -554,5 +554,21 @@
     {
         "date": "2026-11-18",
         "liquidation": 284.51
+    },
+    {
+        "date": "2026-11-19",
+        "liquidation": 120.05
+    },
+    {
+        "date": "2026-11-20",
+        "liquidation": 53.07
+    },
+    {
+        "date": "2026-11-23",
+        "liquidation": 111.47
+    },
+    {
+        "date": "2026-11-24",
+        "liquidation": 136.75
     }
 ]

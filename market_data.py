@@ -752,7 +752,8 @@ def fetch_kospi_trade_value(existing_item=None):
 def compute_kospi_adr(existing_item=None):
     """
     Compute 20-day KOSPI ADR (Advance Decline Ratio, %) dynamically.
-    Combines local data/adv_dec_history.json with real-time Naver integration API upDownStockInfo.
+    Combines local data/adv_dec_history.json with real-time KIS Developers API TR FHPUP02100000
+    (with Naver mobile integration API fallback).
     """
     adr_path = os.path.join(os.path.dirname(__file__), "data", "adv_dec_history.json")
     history_records = []
@@ -763,34 +764,66 @@ def compute_kospi_adr(existing_item=None):
         except Exception:
             history_records = []
 
-    # Check live Naver upDownStockInfo
+    rise, fall = 0, 0
+    # 1. Try KIS Developers API (Official Securities Quote TR FHPUP02100000)
     try:
-        url_nav = "https://m.stock.naver.com/api/index/KOSPI/integration"
-        r_nav = requests.get(url_nav, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
-        if r_nav.status_code == 200:
-            nav_data = r_nav.json()
-            up_down = nav_data.get("upDownStockInfo", {})
-            rise = int(up_down.get("riseCount", 0)) + int(up_down.get("upperCount", 0))
-            fall = int(up_down.get("fallCount", 0)) + int(up_down.get("lowerCount", 0))
-            if rise > 0 or fall > 0:
-                expected_d = get_latest_expected_trading_day()
-                dates_set = {x["date"] for x in history_records}
-                if expected_d not in dates_set:
-                    history_records.append({"date": expected_d, "adv": rise, "dec": fall})
-                    history_records.sort(key=lambda x: x["date"])
-                    try:
-                        with open(adr_path, "w", encoding="utf-8") as f_save:
-                            json.dump(history_records[-250:], f_save, indent=4)
-                    except Exception:
-                        pass
-                else:
-                    for rec in history_records:
-                        if rec["date"] == expected_d:
-                            rec["adv"] = rise
-                            rec["dec"] = fall
-                            break
-    except Exception as e:
-        print(f"Error fetching live ADR counts from Naver: {e}")
+        kis_token = get_kis_access_token()
+        app_key = os.getenv("KIS_APP_KEY")
+        app_secret = os.getenv("KIS_APP_SECRET")
+        if kis_token and app_key and app_secret:
+            url_kis = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-index-price"
+            headers_kis = {
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {kis_token}",
+                "appkey": app_key,
+                "appsecret": app_secret,
+                "tr_id": "FHPUP02100000",
+                "custtype": "P"
+            }
+            params_kis = {
+                "FID_COND_MRKT_DIV_CODE": "U",
+                "FID_INPUT_ISCD": "0001"
+            }
+            r_kis = requests.get(url_kis, headers=headers_kis, params=params_kis, timeout=3)
+            if r_kis.status_code == 200:
+                k_data = r_kis.json().get("output", {})
+                r_cnt = int(k_data.get("ascn_issu_cnt", 0)) + int(k_data.get("uplm_issu_cnt", 0))
+                f_cnt = int(k_data.get("down_issu_cnt", 0)) + int(k_data.get("lslm_issu_cnt", 0))
+                if r_cnt > 0 or f_cnt > 0:
+                    rise, fall = r_cnt, f_cnt
+    except Exception as e_kis:
+        print(f"[ADR] KIS API breadth fetch error: {e_kis}")
+
+    # 2. Fallback to Naver integration API if KIS was not available
+    if rise == 0 and fall == 0:
+        try:
+            url_nav = "https://m.stock.naver.com/api/index/KOSPI/integration"
+            r_nav = requests.get(url_nav, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
+            if r_nav.status_code == 200:
+                nav_data = r_nav.json()
+                up_down = nav_data.get("upDownStockInfo", {})
+                rise = int(up_down.get("riseCount", 0)) + int(up_down.get("upperCount", 0))
+                fall = int(up_down.get("fallCount", 0)) + int(up_down.get("lowerCount", 0))
+        except Exception as e_nav:
+            print(f"[ADR] Naver fallback error: {e_nav}")
+
+    if rise > 0 or fall > 0:
+        expected_d = get_latest_expected_trading_day()
+        dates_set = {x["date"] for x in history_records}
+        if expected_d not in dates_set:
+            history_records.append({"date": expected_d, "adv": rise, "dec": fall})
+            history_records.sort(key=lambda x: x["date"])
+        else:
+            for rec in history_records:
+                if rec["date"] == expected_d:
+                    rec["adv"] = rise
+                    rec["dec"] = fall
+                    break
+        try:
+            with open(adr_path, "w", encoding="utf-8") as f_save:
+                json.dump(history_records[-250:], f_save, indent=4)
+        except Exception:
+            pass
 
     if not history_records or len(history_records) < 20:
         return existing_item
@@ -846,89 +879,118 @@ def compute_kospi_adr(existing_item=None):
         pass
     return res_item
 
-def _estimate_vkospi_fallback(old_cache, existing_item, expected_day):
+def fetch_kospi200_futures_direct(existing_item=None, force=False):
     """
-    Mathematical fallback estimation for VKOSPI (KOSPI 200 Volatility Index)
-    when KRX server is unreachable, in maintenance, or unauthenticated.
-    Uses inverse leverage correlation with KOSPI index return and global VIX delta.
+    Fetch KOSPI 200 regular futures via KIS Developers API TR FHMIF10000000 (code: 10100)
+    with seamless Naver FUT fallback and 200-day historical sparkline.
     """
+    expected_day = get_latest_expected_trading_day()
+    if not force and existing_item and existing_item.get("price") is not None:
+        hist = existing_item.get("history", [])
+        if hist:
+            last_d = str(hist[-1].get("date", "")).split("T")[0]
+            if last_d >= expected_day and len(hist) >= 180:
+                return existing_item
+
+    meta = INDICATORS_META.get("KOSPI200_FUTURES", {})
+    # 1. Base historical candles from Naver FUT (up to 240 days)
+    base_item = fetch_naver_price("KOSPI200_FUTURES")
+    base_hist = base_item.get("history", []) if base_item else []
+
+    # 2. Query live quote from KIS Developers API (FHMIF10000000)
+    kis_quote = None
     try:
-        vk_item = existing_item or old_cache.get("vkospi")
-        if not vk_item:
-            return None
-
-        hist = vk_item.get("history", [])
-        if not hist:
-            return None
-
-        last_date = str(hist[-1]["date"]).split("T")[0]
-        if last_date >= expected_day:
-            return existing_item
-
-        # Fetch live KOSPI (^KS11) index history
-        naver_ks11 = fetch_naver_price("^KS11")
-        if not naver_ks11 or not naver_ks11.get("history"):
-            return None
-
-        ks11_map = {str(h["date"]).split("T")[0]: h["value"] for h in naver_ks11["history"]}
-        if last_date not in ks11_map or expected_day not in ks11_map:
-            return None
-
-        k_prev = ks11_map[last_date]
-        k_now = ks11_map[expected_day]
-        if k_prev <= 0:
-            return None
-
-        r = (k_now - k_prev) / k_prev
-        last_val = float(hist[-1]["value"])
-
-        # Asymmetric volatility response:
-        # If market falls (r < 0): VKOSPI expands ~ -0.65 * r * 100
-        # If market rises (r >= 0): VKOSPI softens ~ -0.40 * r * 100
-        vol_sensitivity = 0.65 if r < 0 else 0.40
-        delta_v = -vol_sensitivity * (r * 100.0)
-
-        est_price = round(max(10.0, last_val + delta_v), 2)
-        change_amt = round(est_price - last_val, 2)
-        change_pct = round((change_amt / last_val) * 100, 2) if last_val > 0 else 0.0
-
-        new_hist = list(hist) + [{"date": expected_day, "value": est_price}]
-        sorted_hist = new_hist[-200:]
-
-        meta = INDICATORS_META.get("VKOSPI", {})
-        result_item = {
-            "ticker": "VKOSPI",
-            "name": meta.get("name", "KOSPI200 변동성지수"),
-            "price": est_price,
-            "change_amt": change_amt,
-            "change_percent": change_pct,
-            "open": est_price,
-            "high": est_price,
-            "low": est_price,
-            "close": est_price,
-            "history": sorted_hist,
-            "negative_favorable": meta.get("negative_favorable", True),
-            "is_integer_only": False,
-            "is_percent": False,
-            "trade_date": expected_day
-        }
-
-        update_krx_cache_json({
-            "vkospi": {
-                "price": est_price,
-                "changeAmt": change_amt,
-                "changePercent": change_pct,
-                "open": est_price,
-                "high": est_price,
-                "low": est_price,
-                "close": est_price,
-                "history": [{"date": f"{h['date'][:10]}T00:00:00.000Z", "value": h["value"]} for h in sorted_hist]
+        token = get_kis_access_token()
+        app_key = os.getenv("KIS_APP_KEY")
+        app_secret = os.getenv("KIS_APP_SECRET")
+        if token and app_key and app_secret:
+            url = "https://openapi.koreainvestment.com:9443/uapi/domestic-futureoption/v1/quotations/inquire-price"
+            headers = {
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {token}",
+                "appkey": app_key,
+                "appsecret": app_secret,
+                "tr_id": "FHMIF10000000",
+                "custtype": "P"
             }
-        })
-        return result_item
-    except Exception as e:
-        print(f"Error in _estimate_vkospi_fallback: {e}")
+            params = {
+                "FID_COND_MRKT_DIV_CODE": "F",
+                "FID_INPUT_ISCD": "10100"
+            }
+            r = requests.get(url, headers=headers, params=params, timeout=4)
+            if r.status_code == 200:
+                out = r.json().get("output1", {})
+                if out and out.get("futs_prpr"):
+                    kis_quote = {
+                        "price": float(out.get("futs_prpr")),
+                        "change_amt": float(out.get("futs_prdy_vrss", 0)),
+                        "change_pct": float(out.get("futs_prdy_ctrt", 0)),
+                        "open": float(out.get("futs_oprc", out.get("futs_prpr"))),
+                        "high": float(out.get("futs_hgpr", out.get("futs_prpr"))),
+                        "low": float(out.get("futs_lwpr", out.get("futs_prpr"))),
+                        "close": float(out.get("futs_prpr")),
+                    }
+    except Exception as e_kis:
+        print(f"[KOSPI200 Futures] KIS API error: {e_kis}")
+
+    # If KIS quote obtained, merge with base history
+    if kis_quote:
+        price = kis_quote["price"]
+        chg_amt = kis_quote["change_amt"]
+        chg_pct = kis_quote["change_pct"]
+        open_p = kis_quote["open"]
+        high_p = kis_quote["high"]
+        low_p = kis_quote["low"]
+        close_p = kis_quote["close"]
+
+        hist_map = {str(h["date"])[:10]: h["value"] for h in base_hist}
+        hist_map[expected_day] = price
+        sorted_dates = sorted(hist_map.keys())
+        final_hist = [{"date": d, "value": hist_map[d]} for d in sorted_dates][-200:]
+        trade_date = expected_day
+    elif base_item:
+        return base_item
+    elif existing_item:
+        return existing_item
+    else:
         return None
+
+    res_item = {
+        "ticker": "KOSPI200_FUTURES",
+        "name": meta.get("name", "KOSPI200 선물 지수"),
+        "price": price,
+        "change_amt": chg_amt,
+        "change_percent": chg_pct,
+        "open": open_p,
+        "high": high_p,
+        "low": low_p,
+        "close": close_p,
+        "history": final_hist,
+        "negative_favorable": meta.get("negative_favorable", False),
+        "is_integer_only": False,
+        "is_percent": False,
+        "trade_date": trade_date
+    }
+
+    try:
+        cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+            if isinstance(c_data, dict):
+                c_data["kospi200_futures"] = {
+                    "price": price,
+                    "changeAmt": chg_amt,
+                    "changePercent": chg_pct,
+                    "open": open_p, "high": high_p, "low": low_p, "close": close_p,
+                    "history": [{"date": f"{h['date'][:10]}T00:00:00.000Z", "value": h["value"]} for h in final_hist]
+                }
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(c_data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return res_item
 
 def fetch_vkospi_direct(existing_item=None, force=False):
     """Fetch live VKOSPI from KRX MDCSTAT01201 using PyKRX with safe isolation, auto-reauth, and fallback."""
@@ -1068,71 +1130,39 @@ def fetch_vkospi_direct(existing_item=None, force=False):
         })
         return result_item
 
-    # If KRX query failed or returned no output, engage statistical fallback
-    print("[VKOSPI] KRX MDC query returned no data. Engaging statistical fallback...")
-    fallback_res = _estimate_vkospi_fallback(old_cache, existing_item, expected_day)
-    if fallback_res:
-        return fallback_res
-
-    return existing_item
-
-def _estimate_fundamentals_fallback(old_cache, existing_per, existing_pbr, expected_day):
-    """
-    Mathematical fallback estimation for KOSPI PER and PBR when KRX server is unreachable.
-    Uses aggregate earnings stability: PER_t = PER_{t-1} * (KOSPI_t / KOSPI_{t-1}).
-    """
-    try:
-        from get_kospi_fundamentals import format_iso_date
-        per_item = existing_per or old_cache.get("per")
-        pbr_item = existing_pbr or old_cache.get("pbr")
-        if not per_item or not pbr_item:
-            return {}
-
-        per_hist = per_item.get("history", [])
-        if not per_hist:
-            return {}
-
-        last_date = str(per_hist[-1]["date"]).split("T")[0]
-        if last_date >= expected_day:
-            return {
-                "per": {"history": per_hist},
-                "pbr": {"history": pbr_item.get("history", [])}
-            }
-
-        naver_ks11 = fetch_naver_price("^KS11")
-        if not naver_ks11 or not naver_ks11.get("history"):
-            return {}
-
-        ks11_map = {str(h["date"]).split("T")[0]: h["value"] for h in naver_ks11["history"]}
-        if last_date not in ks11_map or expected_day not in ks11_map:
-            return {}
-
-        k_prev = ks11_map[last_date]
-        k_now = ks11_map[expected_day]
-        if k_prev <= 0:
-            return {}
-
-        ratio = k_now / k_prev
-        last_per = float(per_hist[-1]["value"])
-        last_pbr = float(pbr_item["history"][-1]["value"]) if pbr_item.get("history") else 1.0
-
-        est_per = round(last_per * ratio, 2)
-        est_pbr = round(last_pbr * ratio, 2)
-
-        new_per_hist = list(per_hist) + [{"date": format_iso_date(expected_day), "value": est_per}]
-        new_pbr_hist = list(pbr_item.get("history", [])) + [{"date": format_iso_date(expected_day), "value": est_pbr}]
-
+    # If KRX query failed or returned no output, use existing real item or cache without synthetic estimates
+    print("[VKOSPI] KRX MDC query returned no data. Using existing real item or cache without synthetic estimation.")
+    if existing_item and existing_item.get("price") is not None:
+        return existing_item
+    cached_vk = old_cache.get("vkospi")
+    if cached_vk and cached_vk.get("history"):
+        hist = cached_vk["history"]
+        last_val = hist[-1]["value"]
+        prev_val = hist[-2]["value"] if len(hist) >= 2 else last_val
+        chg = cached_vk.get("changeAmt", round(last_val - prev_val, 2))
+        pct = cached_vk.get("changePercent", round((chg / prev_val) * 100, 2) if prev_val != 0 else 0.0)
+        meta = INDICATORS_META.get("VKOSPI", {})
         return {
-            "per": {"history": new_per_hist},
-            "pbr": {"history": new_pbr_hist}
+            "ticker": "VKOSPI",
+            "name": meta.get("name", "KOSPI200 변동성지수"),
+            "price": last_val,
+            "change_amt": chg,
+            "change_percent": pct,
+            "open": cached_vk.get("open", last_val),
+            "high": cached_vk.get("high", last_val),
+            "low": cached_vk.get("low", last_val),
+            "close": last_val,
+            "history": [{"date": str(h["date"])[:10], "value": h["value"]} for h in hist][-200:],
+            "negative_favorable": meta.get("negative_favorable", True),
+            "is_integer_only": False,
+            "is_percent": False,
+            "trade_date": str(hist[-1]["date"])[:10]
         }
-    except Exception as e:
-        print(f"Error in _estimate_fundamentals_fallback: {e}")
-        return {}
+    return None
 
 def fetch_fundamentals_direct(existing_per=None, existing_pbr=None, force=False):
     """
-    Fetch KOSPI PER and PBR directly using PyKRX with history merging and live fallback estimation.
+    Fetch KOSPI PER and PBR directly using PyKRX with history merging (without synthetic fake estimations).
     """
     expected_day = get_latest_expected_trading_day()
     if not force and existing_per and existing_pbr:
@@ -1172,12 +1202,33 @@ def fetch_fundamentals_direct(existing_per=None, existing_pbr=None, force=False)
                 print(f"[Fundamentals Direct] task_fundamentals error: {e}")
 
         if not fund_res or not fund_res.get("per"):
-            fund_res = _estimate_fundamentals_fallback(old_cache, existing_per, existing_pbr, expected_day)
-
-        if not fund_res:
+            print("[Fundamentals Direct] PyKRX returned no data. Using existing real item or cache without synthetic estimation.")
             fallback = {}
             if existing_per: fallback["KOSPI_PER"] = existing_per
             if existing_pbr: fallback["KOSPI_PBR"] = existing_pbr
+            if not fallback:
+                for key, ticker in [("per", "KOSPI_PER"), ("pbr", "KOSPI_PBR")]:
+                    cached = old_cache.get(key)
+                    if cached and cached.get("history"):
+                        hist = cached["history"]
+                        last_val = hist[-1]["value"]
+                        prev_val = hist[-2]["value"] if len(hist) >= 2 else last_val
+                        chg = cached.get("changeAmt", round(last_val - prev_val, 2))
+                        pct = cached.get("changePercent", round((chg / prev_val) * 100, 2) if prev_val != 0 else 0.0)
+                        meta = INDICATORS_META.get(ticker, {})
+                        fallback[ticker] = {
+                            "ticker": ticker,
+                            "name": meta.get("name", ticker),
+                            "price": last_val,
+                            "change_amt": chg,
+                            "change_percent": pct,
+                            "open": None, "high": None, "low": None, "close": last_val,
+                            "history": [{"date": str(h["date"])[:10], "value": h["value"]} for h in hist][-200:],
+                            "negative_favorable": meta.get("negative_favorable", False),
+                            "is_integer_only": False,
+                            "is_percent": False,
+                            "trade_date": str(hist[-1]["date"])[:10]
+                        }
             return fallback
 
         results = {}
@@ -2021,10 +2072,11 @@ def fetch_all_market_data(force_refresh=False, wait_for_krx=False):
     # 3. Korean Market parallel direct updates
     korean_tickers = [
         "005930.KS", "009150.KS", "402340.KS", "000660.KS",
-        "^KS11", "^KQ11", "KOSPI200_FUTURES"
+        "^KS11", "^KQ11"
     ]
     with ThreadPoolExecutor(max_workers=8) as executor:
         fut_naver = executor.map(fetch_naver_price, korean_tickers)
+        fut_futures = executor.submit(fetch_kospi200_futures_direct, all_data.get("KOSPI200_FUTURES"), force_refresh)
         fut_vkospi = executor.submit(fetch_vkospi_direct, all_data.get("VKOSPI"), force_refresh)
         fut_kofia = executor.submit(
             fetch_kofia_stats_direct,
@@ -2041,6 +2093,12 @@ def fetch_all_market_data(force_refresh=False, wait_for_krx=False):
         )
 
         naver_results = list(fut_naver)
+        try:
+            reg_fut_item = fut_futures.result(timeout=15.0)
+        except Exception as e:
+            print(f"Error fetching KOSPI200 Futures: {e}")
+            reg_fut_item = None
+
         try:
             vk_item = fut_vkospi.result(timeout=25.0)
         except Exception as e:
@@ -2062,6 +2120,9 @@ def fetch_all_market_data(force_refresh=False, wait_for_krx=False):
     for item in naver_results:
         if item:
             all_data[item["ticker"]] = item
+
+    if reg_fut_item:
+        all_data["KOSPI200_FUTURES"] = reg_fut_item
 
     if vk_item:
         all_data["VKOSPI"] = vk_item
