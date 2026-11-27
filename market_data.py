@@ -23,6 +23,8 @@ except Exception:
         sys.modules["pkg_resources"] = pkg_mock
 
 import json
+import sqlite3
+from pathlib import Path
 import requests
 import subprocess
 import threading
@@ -40,136 +42,141 @@ from config import INDICATORS_META, INTEGER_ONLY_TICKERS, KRX_HOLIDAYS
 
 _krx_update_lock = threading.Lock()
 _krx_updating = False
-_pykrx_patched = False
+_pykrx_patched = True
 
 def patch_pykrx_auth():
-    """
-    Monkey-patch pykrx auth to automatically handle CD010 (password change postponement)
-    and ensure console outputs never raise UnicodeEncodeError on Windows CP949 environments.
-    """
-    global _pykrx_patched
-    if _pykrx_patched:
-        return
-    try:
-        import pykrx.website.comm.auth as krx_auth
-        
-        orig_login_krx = getattr(krx_auth, "login_krx", None)
-        if not orig_login_krx:
-            return
-
-        def robust_login_krx(login_id: str, login_pw: str, session=None) -> bool:
-            if session is None:
-                session = requests.Session()
-
-            krx_auth.warmup_krx_session(session)
-
-            payload = {
-                "mbrNm": "",
-                "telNo": "",
-                "di": "",
-                "certType": "",
-                "mbrId": login_id,
-                "pw": login_pw,
-            }
-            headers = {"User-Agent": krx_auth.USER_AGENT, "Referer": krx_auth.LOGIN_PAGE}
-
-            try:
-                resp = session.post(krx_auth.LOGIN_URL, data=payload, headers=headers, timeout=15)
-                data = resp.json()
-            except Exception as e:
-                print(f"[KRX Auth] Login request failed: {e}")
-                return False
-
-            error_code = data.get("_error_code", "")
-            error_message = data.get("_error_message", "")
-
-            # CD010: 패스워드 변경 필요 -> 자동 연기(postpone) 처리 후 재로그인
-            if error_code == "CD010":
-                try:
-                    postpone_url = "https://data.krx.co.kr/contents/MDC/COMS/client/postponePasswordChange.cmd"
-                    session.post(postpone_url, headers=headers, timeout=15)
-                    payload["skipDup"] = "Y"
-                    resp = session.post(krx_auth.LOGIN_URL, data=payload, headers=headers, timeout=15)
-                    data = resp.json()
-                    error_code = data.get("_error_code", "")
-                    error_message = data.get("_error_message", "")
-                except Exception:
-                    pass
-
-                if error_code == "CD010":
-                    print("[KRX 경고] KRX 비밀번호 변경이 필요합니다.")
-                    print(f"   오류 메시지: {error_message}")
-                    return False
-
-            # CD011: 중복 로그인 (skipDup 처리)
-            if error_code == "CD011":
-                payload["skipDup"] = "Y"
-                try:
-                    resp = session.post(krx_auth.LOGIN_URL, data=payload, headers=headers, timeout=15)
-                    data = resp.json()
-                    error_code = data.get("_error_code", "")
-                    error_message = data.get("_error_message", "")
-                except Exception:
-                    pass
-
-            if error_code != "CD001":
-                print(f"[KRX 경고] KRX 로그인 실패: {error_message} (코드: {error_code})")
-                return False
-
-            return True
-
-        krx_auth.login_krx = robust_login_krx
-        _pykrx_patched = True
-    except Exception as e:
-        pass
+    """No-op: KRX direct authentication is decoupled. All KRX data is served via SQLite cache DB."""
+    pass
 
 def load_krx_auth():
-    """Load KRX credentials from Streamlit secrets, workspace, or 00 API Key folder."""
-    # 1. Streamlit Cloud Secrets
+    """No-op: KRX direct authentication is decoupled. All KRX data is served via SQLite cache DB."""
+    pass
+
+def get_krx_db_path():
+    """Locate the centralized KRX SQLite cache DB."""
+    from pathlib import Path
+    server_db = Path("/home/ubuntu/apps/data/krx_market_cache.db")
+    if server_db.exists():
+        return server_db
+
+    current_dir = Path(__file__).resolve().parent
+    local_db = current_dir.parent / "00 Bookmarks" / "data" / "krx_market_cache.db"
+    if local_db.exists():
+        return local_db
+
+    app_db = current_dir / "data" / "krx_market_cache.db"
+    if app_db.exists():
+        return app_db
+
+    return local_db
+
+def format_iso_date(date_str):
+    if isinstance(date_str, str):
+        clean_date = date_str.replace('/', '-').split('T')[0]
+        dt = datetime.strptime(clean_date, "%Y-%m-%d")
+    else:
+        dt = date_str
+    return dt.strftime("%Y-%m-%dT00:00:00.000Z")
+
+def get_data_path(filename):
+    """Return absolute path to a file inside the local data/ directory."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, filename)
+
+def fetch_kofia_deposits_credit(start_date, end_date):
+    """Fetch customer deposits and credit balance directly from KOFIA FreeSIS API."""
+    url = "https://freesis.kofia.or.kr/meta/getMetaDataList.do"
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": "https://freesis.kofia.or.kr/stat/FreeSIS.do",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    deposit_map = {}
+    payload_dep = {
+        "dmSearch": {
+            "tmpV40": "1000000",
+            "tmpV41": "1",
+            "tmpV1": "D",
+            "tmpV45": start_date,
+            "tmpV46": end_date,
+            "OBJ_NM": "STATSCU0100000060BO"
+        }
+    }
     try:
-        import streamlit as st
-        if hasattr(st, "secrets"):
-            if "KRX_ID" in st.secrets and not os.getenv("KRX_ID"):
-                os.environ["KRX_ID"] = str(st.secrets["KRX_ID"]).strip()
-            if "KRX_PW" in st.secrets and not os.getenv("KRX_PW"):
-                os.environ["KRX_PW"] = str(st.secrets["KRX_PW"]).strip()
-    except Exception:
-        pass
+        res_dep = requests.post(url, headers=headers, json=payload_dep, timeout=5)
+        if res_dep.status_code == 200:
+            items = res_dep.json().get("ds1", [])
+            for item in items:
+                date_raw = str(item.get("TMPV1"))
+                if len(date_raw) == 8:
+                    date_str = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+                    val = float(item.get("TMPV2", 0)) * 0.01
+                    deposit_map[date_str] = round(val, 2)
+    except Exception as e:
+        print(f"Error fetching KOFIA deposits: {e}")
 
-    # 2. Local workspace and system dotenv
+    credit_map = {}
+    payload_cred = {
+        "dmSearch": {
+            "tmpV40": "1000000",
+            "tmpV41": "1",
+            "tmpV1": "D",
+            "tmpV45": start_date,
+            "tmpV46": end_date,
+            "OBJ_NM": "STATSCU0100000070BO"
+        }
+    }
     try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        ws_env = os.path.join(script_dir, ".env")
-        if os.path.exists(ws_env):
-            load_dotenv(ws_env)
-        krx_env_path = r"D:\AI Investing\KRXdata\.env"
-        if os.path.exists(krx_env_path):
-            load_dotenv(krx_env_path)
-    except Exception:
-        pass
+        res_cred = requests.post(url, headers=headers, json=payload_cred, timeout=5)
+        if res_cred.status_code == 200:
+            items = res_cred.json().get("ds1", [])
+            for item in items:
+                date_raw = str(item.get("TMPV1"))
+                if len(date_raw) == 8:
+                    date_str = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+                    val = float(item.get("TMPV2", 0)) * 0.01
+                    credit_map[date_str] = round(val, 2)
+    except Exception as e:
+        print(f"Error fetching KOFIA credit: {e}")
 
-    if not os.getenv("KRX_ID") or not os.getenv("KRX_PW"):
-        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        api_key_path = os.path.join(parent_dir, "00 API Key", "KRX ID&PW.txt")
-        if not os.path.exists(api_key_path):
-            api_key_path = r"D:\AI Investing\00 API Key\KRX ID&PW.txt"
-        if os.path.exists(api_key_path):
-            try:
-                with open(api_key_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("ID :") or line.startswith("ID:"):
-                            os.environ["KRX_ID"] = line.split(":", 1)[1].strip()
-                        elif line.startswith("PW :") or line.startswith("PW:"):
-                            os.environ["KRX_PW"] = line.split(":", 1)[1].strip()
-            except Exception:
-                pass
+    return deposit_map, credit_map
 
-    patch_pykrx_auth()
-
-load_krx_auth()
+def fetch_kofia_liquidation(start_date, end_date):
+    """Fetch margin call liquidation amount directly from KOFIA FreeSIS API."""
+    url = "https://freesis.kofia.or.kr/meta/getMetaDataList.do"
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": "https://freesis.kofia.or.kr/stat/FreeSIS.do",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    liq_map = {}
+    payload = {
+        "dmSearch": {
+            "tmpV40": "1000000",
+            "tmpV41": "1",
+            "tmpV1": "D",
+            "tmpV45": start_date,
+            "tmpV46": end_date,
+            "OBJ_NM": "STATSCU0100000060BO"
+        }
+    }
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=5)
+        if res.status_code == 200:
+            items = res.json().get("ds1", [])
+            for item in items:
+                date_raw = str(item.get("TMPV1"))
+                if len(date_raw) == 8:
+                    date_str = f"{date_raw[0:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+                    val = float(item.get("TMPV6", 0)) * 0.01
+                    liq_map[date_str] = round(val, 2)
+    except Exception as e:
+        print(f"Error fetching KOFIA liquidation: {e}")
+    return liq_map
 
 _CACHED_TRADING_DAYS = None
 
@@ -341,13 +348,8 @@ def get_latest_expected_night_date(now_kst=None) -> str:
     return now_kst.strftime("%Y-%m-%d")
 
 def trigger_krx_background_update(wait=False):
-    """Backward compatibility wrapper - runs fast update if requested."""
-    if wait:
-        try:
-            from get_kospi_fundamentals import update_krx_cache
-            update_krx_cache()
-        except Exception as e:
-            print(f"Error in update_krx_cache: {e}")
+    """No-op: All KRX data is served via SQLite cache DB."""
+    pass
 
 
 def get_fear_and_greed():
@@ -394,10 +396,10 @@ def get_krx_cache_data(force_update=False, wait=False):
     cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
     if not os.path.exists(cache_path):
         try:
-            from get_kospi_fundamentals import update_krx_cache
-            update_krx_cache()
-        except Exception as e:
-            print(f"Error initializing krx_cache.json: {e}")
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+        except Exception:
+            pass
 
 
     try:
@@ -752,8 +754,9 @@ def fetch_kospi_trade_value(existing_item=None):
 def compute_kospi_adr(existing_item=None):
     """
     Compute 20-day KOSPI ADR (Advance Decline Ratio, %) dynamically.
-    Combines local data/adv_dec_history.json with real-time KIS Developers API TR FHPUP02100000
-    (with Naver mobile integration API fallback).
+    Combines SQLite cache DB (market_adr table), local data/adv_dec_history.json,
+    and real-time KIS Developers API TR FHPUP02100000 (with Naver mobile fallback).
+    Zero direct KRX scraping.
     """
     adr_path = os.path.join(os.path.dirname(__file__), "data", "adv_dec_history.json")
     history_records = []
@@ -763,6 +766,32 @@ def compute_kospi_adr(existing_item=None):
                 history_records = json.load(f)
         except Exception:
             history_records = []
+
+    # 0. Sync from SQLite cache DB (market_adr table)
+    db_path = get_krx_db_path()
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT date, advances, declines
+                FROM market_adr
+                WHERE market = 'KOSPI' AND (advances > 0 OR declines > 0)
+                ORDER BY date ASC
+            """)
+            db_adr_rows = cur.fetchall()
+            conn.close()
+
+            hist_dict = {item["date"]: item for item in history_records if "date" in item}
+            for row in db_adr_rows:
+                d_raw = str(row[0]).strip()
+                d_fmt = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:]}" if len(d_raw) == 8 else d_raw
+                adv_cnt = int(row[1])
+                dec_cnt = int(row[2])
+                hist_dict[d_fmt] = {"date": d_fmt, "adv": adv_cnt, "dec": dec_cnt}
+            history_records = sorted(hist_dict.values(), key=lambda x: x["date"])
+        except Exception as e:
+            print(f"[ADR] DB sync error: {e}")
 
     rise, fall = 0, 0
     # 1. Try KIS Developers API (Official Securities Quote TR FHPUP02100000)
@@ -993,15 +1022,10 @@ def fetch_kospi200_futures_direct(existing_item=None, force=False):
     return res_item
 
 def fetch_vkospi_direct(existing_item=None, force=False):
-    """Fetch live VKOSPI from KRX MDCSTAT01201 using PyKRX with safe isolation, auto-reauth, and fallback."""
-    expected_day = get_latest_expected_trading_day()
-    if not force and existing_item and existing_item.get("price") is not None:
-        hist = existing_item.get("history", [])
-        if hist:
-            last_d = str(hist[-1].get("date", "")).split("T")[0]
-            if last_d >= expected_day and len(hist) >= 180:
-                return existing_item
-
+    """
+    Fetch VKOSPI from SQLite cache DB (krx_market_cache.db) with local krx_cache.json fallback.
+    Zero direct KRX scraping.
+    """
     # Read local cache for base history
     cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
     old_cache = {}
@@ -1012,91 +1036,40 @@ def fetch_vkospi_direct(existing_item=None, force=False):
         except Exception:
             pass
 
-    output = []
-    try:
-        load_krx_auth()
-        from pykrx.website.krx.krxio import KrxWebIo
+    # 1. Query SQLite cache DB
+    db_path = get_krx_db_path()
+    db_rows = []
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT date, close
+                FROM index_fundamentals
+                WHERE ticker = 'VKOSPI' AND close > 0
+                ORDER BY date ASC
+            """)
+            db_rows = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"[VKOSPI] SQLite DB query notice: {e}")
 
-        class RobustKrxMdc(KrxWebIo):
-            @property
-            def bld(self):
-                return 'dbms/MDC/STAT/standard/MDCSTAT01201'
+    cache_hist = old_cache.get("vkospi", {}).get("history", [])
+    base_hist = (existing_item.get("history") if existing_item and existing_item.get("history") else cache_hist) or []
+    hist_map = {str(h["date"]).split("T")[0]: float(h["value"]) for h in base_hist if "date" in h and "value" in h}
 
-            def read_safe(self, **params):
-                for attempt in range(2):
-                    try:
-                        res = self.read(**params)
-                        if res and isinstance(res, dict) and res.get('output'):
-                            return res
-                    except Exception as e:
-                        print(f"[VKOSPI] MDCSTAT01201 query attempt {attempt+1} failed: {e}")
+    for row in db_rows:
+        d_raw = str(row[0]).strip()
+        d_fmt = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:]}" if len(d_raw) == 8 else d_raw
+        hist_map[d_fmt] = round(float(row[1]), 2)
 
-                    # Force session re-authentication on failure
-                    try:
-                        import pykrx.website.comm.auth as krx_auth
-                        login_id = os.getenv("KRX_ID")
-                        login_pw = os.getenv("KRX_PW")
-                        if login_id and login_pw:
-                            print("[VKOSPI] Re-authenticating KRX session...")
-                            s = krx_auth.get_auth_session()
-                            if s:
-                                s.is_authenticated = False
-                                s.refresh(login_id, login_pw)
-                            else:
-                                krx_auth._auth_session = krx_auth.build_krx_session(login_id, login_pw)
-                    except Exception as reauth_err:
-                        print(f"[VKOSPI] Reauth error: {reauth_err}")
-                return None
-
-        today = datetime.now(KST)
-        start_date = (today - timedelta(days=350)).strftime("%Y%m%d")
-        end_date = today.strftime("%Y%m%d")
-
-        with _krx_pykrx_lock:
-            krx = RobustKrxMdc()
-            res = krx.read_safe(
-                locale='ko_KR',
-                indTpCd='1',
-                idxIndCd='300',
-                strtDd=start_date,
-                endDd=end_date,
-                share='1',
-                money='1'
-            )
-            if res and isinstance(res, dict):
-                output = res.get('output', [])
-    except Exception as e:
-        print(f"Error in fetch_vkospi_direct KRX query: {e}")
-
-    if output and len(output) >= 2:
-        latest = output[0]
-        prev = output[1]
-        price = round(float(str(latest['CLSPRC_IDX']).replace(',', '')), 2)
-        prev_price = round(float(str(prev['CLSPRC_IDX']).replace(',', '')), 2)
-        change = round(price - prev_price, 2)
-        pct = round((change / prev_price) * 100, 2) if prev_price != 0 else 0.0
-
-        open_p = round(float(str(latest.get('OPNPRC_IDX', price)).replace(',', '')), 2)
-        high_p = round(float(str(latest.get('HGPRC_IDX', price)).replace(',', '')), 2)
-        low_p = round(float(str(latest.get('LWPRC_IDX', price)).replace(',', '')), 2)
-
-        new_hist = []
-        for row in reversed(output):
-            d_str = str(row.get('TRD_DD', '')).strip().replace('/', '-')
-            if len(d_str) == 8 and '-' not in d_str:
-                d_fmt = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:]}"
-            else:
-                d_fmt = d_str
-            if len(d_fmt) == 10:
-                new_hist.append({"date": d_fmt, "value": round(float(str(row['CLSPRC_IDX']).replace(',', '')), 2)})
-
-        cache_hist = old_cache.get("vkospi", {}).get("history", [])
-        base_hist = (existing_item.get("history") if existing_item and existing_item.get("history") else cache_hist) or []
-        hist_map = {str(h["date"]).split("T")[0]: h["value"] for h in base_hist if "date" in h and "value" in h}
-        for nh in new_hist:
-            hist_map[nh["date"]] = nh["value"]
+    if hist_map:
         sorted_dates = sorted(hist_map.keys())
         final_hist = [{"date": d, "value": hist_map[d]} for d in sorted_dates][-200:]
+        price = final_hist[-1]["value"]
+        prev_price = final_hist[-2]["value"] if len(final_hist) >= 2 else price
+        change = round(price - prev_price, 2)
+        pct = round((change / prev_price) * 100, 2) if prev_price != 0 else 0.0
 
         meta = INDICATORS_META.get("VKOSPI", {})
         result_item = {
@@ -1105,9 +1078,9 @@ def fetch_vkospi_direct(existing_item=None, force=False):
             "price": price,
             "change_amt": change,
             "change_percent": pct,
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
+            "open": price,
+            "high": price,
+            "low": price,
             "close": price,
             "history": final_hist,
             "negative_favorable": meta.get("negative_favorable", True),
@@ -1121,19 +1094,18 @@ def fetch_vkospi_direct(existing_item=None, force=False):
                 "price": price,
                 "changeAmt": change,
                 "changePercent": pct,
-                "open": open_p,
-                "high": high_p,
-                "low": low_p,
+                "open": price,
+                "high": price,
+                "low": price,
                 "close": price,
                 "history": [{"date": f"{h['date']}T00:00:00.000Z", "value": h["value"]} for h in final_hist]
             }
         })
         return result_item
 
-    # If KRX query failed or returned no output, use existing real item or cache without synthetic estimates
-    print("[VKOSPI] KRX MDC query returned no data. Using existing real item or cache without synthetic estimation.")
     if existing_item and existing_item.get("price") is not None:
         return existing_item
+
     cached_vk = old_cache.get("vkospi")
     if cached_vk and cached_vk.get("history"):
         hist = cached_vk["history"]
@@ -1162,93 +1134,56 @@ def fetch_vkospi_direct(existing_item=None, force=False):
 
 def fetch_fundamentals_direct(existing_per=None, existing_pbr=None, force=False):
     """
-    Fetch KOSPI PER and PBR directly using PyKRX with history merging (without synthetic fake estimations).
+    Fetch KOSPI PER and PBR from SQLite cache DB (krx_market_cache.db) with local krx_cache.json fallback.
+    Zero direct KRX scraping.
     """
-    expected_day = get_latest_expected_trading_day()
-    if not force and existing_per and existing_pbr:
-        per_hist = existing_per.get("history", [])
-        if per_hist:
-            last_d = str(per_hist[-1].get("date", "")).split("T")[0]
-            if last_d >= expected_day and len(per_hist) >= 180:
-                return {
-                    "KOSPI_PER": existing_per,
-                    "KOSPI_PBR": existing_pbr
-                }
+    cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
+    old_cache = {}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                old_cache = json.load(f)
+        except Exception:
+            pass
 
-    try:
-        load_krx_auth()
-        from get_kospi_fundamentals import task_fundamentals, format_iso_date
-        today = datetime.now(KST)
+    # 1. Query SQLite cache DB
+    db_path = get_krx_db_path()
+    db_rows = []
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT date, per, pbr
+                FROM index_fundamentals
+                WHERE ticker = '1001' AND (per > 0 OR pbr > 0)
+                ORDER BY date ASC
+            """)
+            db_rows = cur.fetchall()
+            conn.close()
+        except Exception as e:
+            print(f"[Fundamentals Direct] SQLite DB query notice: {e}")
 
-        cache_path = os.path.join(os.path.dirname(__file__), "krx_cache.json")
-        old_cache = {}
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    old_cache = json.load(f)
-            except Exception:
-                pass
+    results = {}
+    cache_updates = {}
 
-        per_cache_len = len(old_cache.get("per", {}).get("history", []))
-        days_back = 350 if (per_cache_len < 190 or force) else 45
-        start_date = (today - timedelta(days=days_back)).strftime("%Y%m%d")
-        end_date = today.strftime("%Y%m%d")
+    for key, ticker in [("per", "KOSPI_PER"), ("pbr", "KOSPI_PBR")]:
+        old_hist = old_cache.get(key, {}).get("history", [])
+        base_hist = (existing_per.get("history") if key == "per" and existing_per and existing_per.get("history") else None) or \
+                    (existing_pbr.get("history") if key == "pbr" and existing_pbr and existing_pbr.get("history") else None) or old_hist
+        hist_map = {str(h['date'])[:10]: float(h['value']) for h in base_hist if 'date' in h and 'value' in h}
 
-        fund_res = {}
-        with _krx_pykrx_lock:
-            try:
-                fund_res = task_fundamentals(start_date, end_date)
-            except Exception as e:
-                print(f"[Fundamentals Direct] task_fundamentals error: {e}")
+        col_idx = 1 if key == "per" else 2
+        for row in db_rows:
+            d_raw = str(row[0]).strip()
+            d_fmt = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:]}" if len(d_raw) == 8 else d_raw
+            val = float(row[col_idx])
+            if val > 0:
+                hist_map[d_fmt] = round(val, 2)
 
-        if not fund_res or not fund_res.get("per"):
-            print("[Fundamentals Direct] PyKRX returned no data. Using existing real item or cache without synthetic estimation.")
-            fallback = {}
-            if existing_per: fallback["KOSPI_PER"] = existing_per
-            if existing_pbr: fallback["KOSPI_PBR"] = existing_pbr
-            if not fallback:
-                for key, ticker in [("per", "KOSPI_PER"), ("pbr", "KOSPI_PBR")]:
-                    cached = old_cache.get(key)
-                    if cached and cached.get("history"):
-                        hist = cached["history"]
-                        last_val = hist[-1]["value"]
-                        prev_val = hist[-2]["value"] if len(hist) >= 2 else last_val
-                        chg = cached.get("changeAmt", round(last_val - prev_val, 2))
-                        pct = cached.get("changePercent", round((chg / prev_val) * 100, 2) if prev_val != 0 else 0.0)
-                        meta = INDICATORS_META.get(ticker, {})
-                        fallback[ticker] = {
-                            "ticker": ticker,
-                            "name": meta.get("name", ticker),
-                            "price": last_val,
-                            "change_amt": chg,
-                            "change_percent": pct,
-                            "open": None, "high": None, "low": None, "close": last_val,
-                            "history": [{"date": str(h["date"])[:10], "value": h["value"]} for h in hist][-200:],
-                            "negative_favorable": meta.get("negative_favorable", False),
-                            "is_integer_only": False,
-                            "is_percent": False,
-                            "trade_date": str(hist[-1]["date"])[:10]
-                        }
-            return fallback
-
-        results = {}
-        cache_updates = {}
-        for key, ticker in [("per", "KOSPI_PER"), ("pbr", "KOSPI_PBR")]:
-            item = fund_res.get(key)
-            if not item:
-                if key == "per" and existing_per: results[ticker] = existing_per
-                if key == "pbr" and existing_pbr: results[ticker] = existing_pbr
-                continue
-
-            old_hist = old_cache.get(key, {}).get("history", [])
-            base_hist = (existing_per.get("history") if key == "per" and existing_per and existing_per.get("history") else None) or old_hist
-            hist_map = {str(h['date'])[:10]: h['value'] for h in base_hist if 'date' in h and 'value' in h}
-            for nh in item.get("history", []):
-                hist_map[str(nh['date'])[:10]] = nh['value']
-
+        if hist_map:
             merged_dates = sorted(hist_map.keys())
             final_history = [{"date": format_iso_date(d), "value": hist_map[d]} for d in merged_dates][-200:]
-
             latest_val = final_history[-1]['value']
             prev_val = final_history[-2]['value'] if len(final_history) >= 2 else latest_val
             chg = round(latest_val - prev_val, 2)
@@ -1275,16 +1210,16 @@ def fetch_fundamentals_direct(existing_per=None, existing_pbr=None, force=False)
                 "history": final_history
             }
 
-        if cache_updates:
-            update_krx_cache_json(cache_updates)
+    if cache_updates:
+        update_krx_cache_json(cache_updates)
 
+    if results:
         return results
-    except Exception as e:
-        print(f"Error in fetch_fundamentals_direct: {e}")
-        fallback = {}
-        if existing_per: fallback["KOSPI_PER"] = existing_per
-        if existing_pbr: fallback["KOSPI_PBR"] = existing_pbr
-        return fallback
+
+    fallback = {}
+    if existing_per: fallback["KOSPI_PER"] = existing_per
+    if existing_pbr: fallback["KOSPI_PBR"] = existing_pbr
+    return fallback
 
 def fetch_kofia_stats_direct(existing_dep=None, existing_cred=None, existing_liq=None, force=False):
     """
@@ -1305,7 +1240,6 @@ def fetch_kofia_stats_direct(existing_dep=None, existing_cred=None, existing_liq
                 }
 
     try:
-        from get_kospi_fundamentals import fetch_kofia_deposits_credit, fetch_kofia_liquidation, get_data_path, format_iso_date
         today_k = datetime.now(KST)
         start_date_k = (today_k - timedelta(days=20)).strftime("%Y%m%d")
         end_date_k = today_k.strftime("%Y%m%d")

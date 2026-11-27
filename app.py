@@ -37,7 +37,7 @@ KST = timezone(timedelta(hours=9))
 try:
     from config import CATEGORIES, US_MARKET_TICKERS, K_MARKET_TICKERS, SEMI_MARKET_TICKERS
     import market_data
-    market_data.load_krx_auth()
+    # KRX 직접 로그인은 오라클 서버 SQLite 캐시 DB(krx_market_cache.db) 연동으로 완전 대체됨
     importlib.reload(market_data)
     from market_data import fetch_all_market_data
     from card_component import render_card_grid

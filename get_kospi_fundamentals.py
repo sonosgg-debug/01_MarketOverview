@@ -24,59 +24,11 @@ try:
 except Exception:
     pass
 
-# Load KRX environment variables
-# Load from workspace root .env first, then fallback to D:\AI Investing\KRXdata\.env or 00 API Key
+# KRX 직접 로그인은 오라클 서버 SQLite 캐시 DB(krx_market_cache.db) 연동으로 완전 대체됨
 load_dotenv()
-krx_env_path = r"D:\AI Investing\KRXdata\.env"
-if os.path.exists(krx_env_path):
-    load_dotenv(krx_env_path)
-
-if not os.getenv("KRX_ID") or not os.getenv("KRX_PW"):
-    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    api_key_path = os.path.join(parent_dir, "00 API Key", "KRX ID&PW.txt")
-    if not os.path.exists(api_key_path):
-        api_key_path = r"D:\AI Investing\00 API Key\KRX ID&PW.txt"
-    if os.path.exists(api_key_path):
-        try:
-            with open(api_key_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("ID :") or line.startswith("ID:"):
-                        os.environ["KRX_ID"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("PW :") or line.startswith("PW:"):
-                        os.environ["KRX_PW"] = line.split(":", 1)[1].strip()
-        except Exception:
-            pass
-
-# Python 3.12+ 및 Streamlit Cloud 환경에서 pykrx의 pkg_resources 모듈 임포트 에러 방지용 shim
-try:
-    import pkg_resources
-except Exception:
-    try:
-        import setuptools.command
-        import pkg_resources
-    except Exception:
-        import types
-        pkg_mock = types.ModuleType("pkg_resources")
-        pkg_mock.resource_filename = lambda *args, **kwargs: ""
-        pkg_mock.resource_string = lambda *args, **kwargs: b""
-        pkg_mock.Requirement = type("Requirement", (), {"parse": lambda s: s})
-        pkg_mock.get_distribution = lambda *args, **kwargs: type("Dist", (), {"version": "1.0.0"})()
-        sys.modules["pkg_resources"] = pkg_mock
-
-try:
-    from market_data import patch_pykrx_auth
-    patch_pykrx_auth()
-except Exception:
-    pass
 
 stock = None
 KrxWebIo = None
-try:
-    from pykrx import stock
-    from pykrx.website.krx.krxio import KrxWebIo
-except Exception as pykrx_err:
-    print(f"Warning: pykrx failed to initialize (e.g. KRX server maintenance or auth issue): {pykrx_err}", file=sys.stderr)
 
 if "--batch" in sys.argv:
     # Silence stdout but keep stderr for error logging
@@ -476,9 +428,7 @@ def task_ohlcv_pykrx(start_date, end_date):
     return result
 
 def sync_adr_history_pykrx():
-    """Sync recent trading days' advance/decline counts to data/adv_dec_history.json via pykrx."""
-    if stock is None:
-        return []
+    """Sync recent trading days' advance/decline counts from SQLite cache DB or local JSON (zero KRX scraping)."""
     adr_path = get_data_path("adv_dec_history.json")
     history = []
     if os.path.exists(adr_path):
@@ -488,46 +438,28 @@ def sync_adr_history_pykrx():
         except Exception:
             history = []
             
-    existing_dates = {item['date'] for item in history}
-    today_dt = datetime.now(KST)
-    needs_save = False
-    
-    # Check today (if after 15:30 KST on weekday) and the last 3 days
-    check_days = []
-    if today_dt.weekday() < 5 and (today_dt.hour > 15 or (today_dt.hour == 15 and today_dt.minute >= 30)):
-        if today_dt.strftime("%Y%m%d") not in KRX_HOLIDAYS:
-            check_days.append(today_dt)
-    for i in range(1, 4):
-        d = today_dt - timedelta(days=i)
-        if d.weekday() < 5 and d.strftime("%Y%m%d") not in KRX_HOLIDAYS:
-            check_days.append(d)
+    try:
+        from market_data import get_krx_db_path
+        db_path = get_krx_db_path()
+        if db_path.exists():
+            import sqlite3
+            conn = sqlite3.connect(str(db_path), timeout=5)
+            cur = conn.cursor()
+            cur.execute("SELECT date, advances, declines FROM market_adr WHERE market = 'KOSPI' ORDER BY date ASC")
+            rows = cur.fetchall()
+            conn.close()
             
-    check_days.sort()
-    for check_dt in check_days:
-        d_str = check_dt.strftime("%Y-%m-%d")
-        if d_str not in existing_dates:
-            for attempt in range(2):
-                try:
-                    time.sleep(0.3)
-                    df_change = stock.get_market_price_change_by_ticker(d_str.replace('-', ''), d_str.replace('-', ''), market='KOSPI')
-                    if df_change is not None and not df_change.empty:
-                        adv = len(df_change[df_change['등락률'] > 0])
-                        dec = len(df_change[df_change['등락률'] < 0])
-                        if adv > 0 or dec > 0:
-                            history.append({'date': d_str, 'adv': adv, 'dec': dec})
-                            existing_dates.add(d_str)
-                            needs_save = True
-                            break
-                except Exception as e:
-                    print(f"Error fetching advance/decline for {d_str} (attempt {attempt + 1}): {e}", file=sys.stderr)
-                    time.sleep(0.5)
-                
-    if needs_save:
-        history.sort(key=lambda x: x['date'])
-        history = history[-250:]
-        with open(adr_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=4)
-            
+            hist_dict = {item['date']: item for item in history if 'date' in item}
+            for row in rows:
+                d_raw = str(row[0]).strip()
+                d_fmt = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:]}" if len(d_raw) == 8 else d_raw
+                hist_dict[d_fmt] = {'date': d_fmt, 'adv': int(row[1]), 'dec': int(row[2])}
+            history = sorted(hist_dict.values(), key=lambda x: x['date'])[-250:]
+            with open(adr_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=4)
+    except Exception:
+        pass
+        
     return history
 
 def task_local_kofia_adr():
