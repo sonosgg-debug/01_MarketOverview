@@ -1424,7 +1424,46 @@ def fetch_kofia_stats_direct(existing_dep=None, existing_cred=None, existing_liq
 
 
 def get_kis_access_token():
-    """Retrieve or refresh KIS Developers API access token with local file caching and 24h validity."""
+    """
+    공용 KIS 토큰(kis_token.json)을 우선 조회하여 불필요한 신규 발급 요청을 원천적으로 0건으로 유지합니다.
+    - 1순위: 오라클 서버 공용 경로 (/home/ubuntu/apps/kis_token.json)
+    - 2순위: 로컬 PC 공용 경로 (D:\\AI Investing\\00 API Key\\kis_token.json)
+    - 3순위: 앱 내부 로컬 경로 (data/kis_token.json)
+    - 유효한 토큰이 있을 경우 즉시 반환 (유효기간 60초 여유 확인)
+    """
+    import time as _t
+    now_ts = _t.time()
+
+    # 후보 경로 탐색
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+
+    # 1. 환경변수 지정 경로
+    if os.getenv("KIS_TOKEN_FILE"):
+        candidates.append(os.getenv("KIS_TOKEN_FILE"))
+
+    # 2. 오라클 서버 공용 경로
+    candidates.append("/home/ubuntu/apps/kis_token.json")
+
+    # 3. 로컬 PC 공용 경로
+    parent_dir = os.path.dirname(script_dir)
+    candidates.append(os.path.join(parent_dir, "00 API Key", "kis_token.json"))
+    candidates.append(r"D:\AI Investing\00 API Key\kis_token.json")
+
+    # 4. 앱 내부 data 폴더 경로 (폴백)
+    candidates.append(os.path.join(script_dir, "data", "kis_token.json"))
+
+    for token_file in candidates:
+        if os.path.exists(token_file):
+            try:
+                with open(token_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if cached.get("access_token") and cached.get("expires_at", 0) > now_ts + 60:
+                    return cached["access_token"]
+            except Exception as e:
+                print(f"[KIS] Token cache read error from {token_file}: {e}")
+
+    # 모든 공용 토큰 파일이 없거나 만료된 경우에만 최후의 수단으로 발급 시도 (공용 파일에 저장)
     app_key = os.getenv("KIS_APP_KEY")
     app_secret = os.getenv("KIS_APP_SECRET")
     if not app_key or not app_secret:
@@ -1438,19 +1477,8 @@ def get_kis_access_token():
     if not app_key or not app_secret:
         return None
 
-    token_file = os.path.join(os.path.dirname(__file__), "data", "kis_token.json")
-    if os.path.exists(token_file):
-        try:
-            with open(token_file, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            import time as _t
-            if cached.get("expires_at", 0) > _t.time() + 300 and cached.get("access_token"):
-                return cached["access_token"]
-        except Exception as e:
-            print(f"[KIS] Token cache read error: {e}")
-
     try:
-        import time as _t
+        print("[KIS] Warning: No valid shared token found. Executing emergency fallback issuance...")
         url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
         payload = {
             "grant_type": "client_credentials",
@@ -1465,12 +1493,15 @@ def get_kis_access_token():
             cache_data = {
                 "access_token": token,
                 "token_type": data.get("token_type", "Bearer"),
-                "expires_at": _t.time() + expires_in
+                "expires_at": now_ts + expires_in,
+                "issued_at_kst": datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S"),
+                "expires_at_kst": datetime.fromtimestamp(now_ts + expires_in, tz=timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
             }
-            os.makedirs(os.path.dirname(token_file), exist_ok=True)
-            with open(token_file, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f)
-            print("[KIS] New access token issued and cached successfully.")
+            save_file = candidates[1] if os.path.exists("/home/ubuntu/apps") else candidates[2]
+            os.makedirs(os.path.dirname(save_file), exist_ok=True)
+            with open(save_file, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            print(f"[KIS] New emergency access token issued and saved to: {save_file}")
             return token
         else:
             print(f"[KIS] Token issuance failed: {resp.status_code} {data.get('error_description')}")
