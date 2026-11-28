@@ -494,29 +494,27 @@ div[data-testid="stDownloadButton"] > button span,
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Data fetching with Streamlit caching (3 minutes TTL)
-@st.cache_data(ttl=180)
-def get_cached_market_data(cache_token=0):
-    force = (cache_token > 0)
-    return fetch_all_market_data(force_refresh=force), datetime.now(KST)
+# Data fetching with Streamlit caching (5 minutes TTL)
+@st.cache_data(ttl=300)
+def get_cached_market_data(cache_token=0, force_refresh=False):
+    return fetch_all_market_data(force_refresh=force_refresh), datetime.now(KST)
 
 # Token to allow explicit cache invalidation
 if "cache_token" not in st.session_state:
     st.session_state.cache_token = 0
 
 # Fetch Data with spinner when actively refreshing
-if st.session_state.cache_token > 0 and st.session_state.get("refreshing", False):
+is_refreshing = st.session_state.pop("refreshing", False)
+if is_refreshing:
     with st.spinner("최신 시장 데이터 갱신 중..."):
-        all_data, fetch_time = get_cached_market_data(st.session_state.cache_token)
-    st.session_state["refreshing"] = False
+        all_data, fetch_time = get_cached_market_data(st.session_state.cache_token, force_refresh=True)
 else:
-    all_data, fetch_time = get_cached_market_data(st.session_state.cache_token)
+    all_data, fetch_time = get_cached_market_data(st.session_state.cache_token, force_refresh=False)
 
 # Show toast if just refreshed
 if st.session_state.pop("just_refreshed", False):
     st.toast("최신 시장 데이터로 갱신되었습니다.", icon="✅")
 
-# Session state for sector selection
 # Session state for sector selection
 SECTOR_OPTIONS = ["미국 시장 (US)", "한국 시장 (KRX)", "AI 반도체 섹터 (AI & Semi)"]
 legacy_sector_map = {
@@ -548,16 +546,22 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    current_idx = SECTOR_OPTIONS.index(st.session_state.selected_sector) if st.session_state.selected_sector in SECTOR_OPTIONS else 0
+    def on_sector_change():
+        st.session_state.active_sector = st.session_state.sector_radio_select
+        st.session_state.selected_sector = st.session_state.sector_radio_select
+
+    current_idx = SECTOR_OPTIONS.index(st.session_state.active_sector) if st.session_state.active_sector in SECTOR_OPTIONS else 0
 
     chosen_sector = st.radio(
         "🏛️ 시장/섹터 선택",
         options=SECTOR_OPTIONS,
         index=current_idx,
         key="sector_radio_select",
+        on_change=on_sector_change,
         label_visibility="collapsed"
     )
     st.session_state.selected_sector = chosen_sector
+    st.session_state.active_sector = chosen_sector
 
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
@@ -574,8 +578,6 @@ with st.sidebar:
 
     with col_btn2:
         if st.button("🔍 조회", type="primary", use_container_width=True, help="선택한 시장 및 섹터로 대시보드를 조회합니다."):
-            st.cache_data.clear()
-            st.session_state.cache_token += 1
             st.session_state.active_sector = chosen_sector
             st.rerun()
 
