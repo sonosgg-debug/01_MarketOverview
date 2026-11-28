@@ -1397,50 +1397,8 @@ def get_kis_access_token():
             except Exception as e:
                 print(f"[KIS] Token cache read error from {token_file}: {e}")
 
-    # 모든 공용 토큰 파일이 없거나 만료된 경우에만 최후의 수단으로 발급 시도 (공용 파일에 저장)
-    app_key = os.getenv("KIS_APP_KEY")
-    app_secret = os.getenv("KIS_APP_SECRET")
-    if not app_key or not app_secret:
-        try:
-            import streamlit as _st
-            if hasattr(_st, "secrets"):
-                app_key = app_key or _st.secrets.get("KIS_APP_KEY")
-                app_secret = app_secret or _st.secrets.get("KIS_APP_SECRET")
-        except Exception:
-            pass
-    if not app_key or not app_secret:
-        return None
-
-    try:
-        print("[KIS] Warning: No valid shared token found. Executing emergency fallback issuance...")
-        url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
-        payload = {
-            "grant_type": "client_credentials",
-            "appkey": app_key,
-            "appsecret": app_secret
-        }
-        resp = requests.post(url, json=payload, timeout=10)
-        data = resp.json()
-        if resp.status_code == 200 and "access_token" in data:
-            token = data["access_token"]
-            expires_in = data.get("expires_in", 86400)
-            cache_data = {
-                "access_token": token,
-                "token_type": data.get("token_type", "Bearer"),
-                "expires_at": now_ts + expires_in,
-                "issued_at_kst": datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S"),
-                "expires_at_kst": datetime.fromtimestamp(now_ts + expires_in, tz=timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
-            }
-            save_file = candidates[1] if os.path.exists("/home/ubuntu/apps") else candidates[2]
-            os.makedirs(os.path.dirname(save_file), exist_ok=True)
-            with open(save_file, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, indent=2, ensure_ascii=False)
-            print(f"[KIS] New emergency access token issued and saved to: {save_file}")
-            return token
-        else:
-            print(f"[KIS] Token issuance failed: {resp.status_code} {data.get('error_description')}")
-    except Exception as e:
-        print(f"[KIS] Token request error: {e}")
+    # 공용 토큰 파일 부재 시 독자 발급하지 않고 None 반환 (Zero Standalone Issuance 원칙 준수)
+    print("[KIS] Warning: 유효한 공용 KIS 토큰(kis_token.json)을 찾을 수 없습니다. (독자 발급 원천 차단됨)")
     return None
 
 
